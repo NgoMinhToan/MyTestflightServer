@@ -4,11 +4,13 @@ import path from "node:path";
 import type { FastifyBaseLogger } from "fastify";
 import type { Config } from "./config";
 import type {
+  ApkAbi,
+  ApkArtifactRecord,
   AppDetail,
   AppManifest,
   AppRecord,
   AppSummary,
-  DownloadRecord,
+  DownloadLookup,
   VersionRecord,
   VersionSummary,
 } from "./types";
@@ -17,6 +19,30 @@ export const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
 const APK_EXTENSION = /\.apk$/i;
 const DEFAULT_ICON = "app_icon.png";
+
+/**
+ * Supported ABI labels in display/priority order. `universal` first means it is
+ * always the default artifact when present; the rest follow Android's current
+ * device distribution so a split-only version still defaults to the most common
+ * architecture.
+ */
+export const ABI_PRIORITY: readonly ApkAbi[] = [
+  "universal",
+  "arm64-v8a",
+  "armeabi-v7a",
+  "x86_64",
+  "x86",
+  "riscv64",
+  "armeabi",
+];
+const ABI_RANK = new Map<ApkAbi, number>(ABI_PRIORITY.map((abi, index) => [abi, index]));
+const ABI_SET = new Set<string>(ABI_PRIORITY);
+
+export function normalizeAbi(value: unknown): ApkAbi | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return ABI_SET.has(normalized) ? (normalized as ApkAbi) : null;
+}
 
 const ICON_CONTENT_TYPES: Record<string, string> = {
   ".png": "image/png",
@@ -47,6 +73,10 @@ function errorMessage(error: unknown): string {
 
 function nonBlankString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function humanizeAppId(id: string): string {
@@ -192,16 +222,35 @@ export class AppsService {
     return { path: record.iconPath, contentType: record.iconContentType };
   }
 
-  async getDownload(id: string, versionName: string): Promise<DownloadRecord | null> {
+  async getDownload(
+    id: string,
+    versionName: string,
+    abi?: ApkAbi,
+  ): Promise<DownloadLookup> {
     const record = (await this.scan()).find((candidate) => candidate.id === id);
-    if (!record) return null;
+    if (!record) return { ok: false, reason: "app_not_found" };
     const version = record.versions.find((candidate) => candidate.versionName === versionName);
-    if (!version) return null;
+    if (!version) return { ok: false, reason: "version_not_found" };
+
+    const selected = abi
+      ? version.artifacts.find((artifact) => artifact.abi === abi)
+      : version.defaultArtifact;
+    if (!selected) return { ok: false, reason: "abi_not_found" };
+
+    const filename =
+      selected.abi === version.defaultArtifact.abi
+        ? `${record.id}-${version.versionName}.apk`
+        : `${record.id}-${version.versionName}-${selected.abi}.apk`;
+
     return {
-      path: version.apkPath,
-      fileSize: version.sizeBytes,
-      sha256: version.sha256,
-      filename: `${record.id}-${version.versionName}.apk`,
+      ok: true,
+      download: {
+        path: selected.path,
+        fileSize: selected.sizeBytes,
+        sha256: selected.sha256,
+        filename,
+        abi: selected.abi,
+      },
     };
   }
 
@@ -220,15 +269,25 @@ export class AppsService {
   }
 
   private toVersionSummary(appId: string, version: VersionRecord): VersionSummary {
+    const base = `/api/v1/apps/${appId}/versions/${version.versionName}/download`;
+    const defaultArtifact = version.defaultArtifact;
     return {
       versionName: version.versionName,
       versionCode: version.versionCode,
       minSdk: version.minSdk,
       releaseNotes: version.releaseNotes,
       publishedAt: version.publishedAt,
-      sizeBytes: version.sizeBytes,
-      sha256: version.sha256,
-      downloadPath: `/api/v1/apps/${appId}/versions/${version.versionName}/download`,
+      sizeBytes: defaultArtifact.sizeBytes,
+      sha256: defaultArtifact.sha256,
+      downloadPath: base,
+      abis: version.artifacts.map((artifact) => artifact.abi),
+      universal: version.artifacts.some((artifact) => artifact.abi === "universal"),
+      artifacts: version.artifacts.map((artifact) => ({
+        abi: artifact.abi,
+        sizeBytes: artifact.sizeBytes,
+        sha256: artifact.sha256,
+        downloadPath: `${base}?abi=${encodeURIComponent(artifact.abi)}`,
+      })),
     };
   }
 
@@ -343,10 +402,10 @@ export class AppsService {
       if (isNotFound(error)) return null;
       throw error;
     }
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    if (!isPlainObject(raw)) {
       throw new Error("version.json must contain a JSON object");
     }
-    const manifest = raw as Record<string, unknown>;
+    const manifest = raw;
 
     const versionCode = manifest.versionCode;
     if (
@@ -374,11 +433,12 @@ export class AppsService {
       versionName = declaredName;
     }
 
-    const apk = await this.resolveApk(versionDir, manifest.file);
-    if (!apk) {
+    const artifacts = await this.resolveArtifacts(versionDir, manifest);
+    if (artifacts.length === 0) {
       this.logger.warn({ versionDir }, "skipping version without a resolvable APK");
       return null;
     }
+    const defaultArtifact = artifacts[0];
 
     const minSdkValue = manifest.minSdk;
     const minSdk =
@@ -391,20 +451,20 @@ export class AppsService {
       versionCode,
       minSdk,
       releaseNotes: typeof manifest.releaseNotes === "string" ? manifest.releaseNotes : null,
-      publishedAt: resolvePublishedAt(manifest.publishedAt, apk.mtime),
-      sizeBytes: apk.sizeBytes,
-      sha256: resolveSha256(manifest.sha256),
-      apkPath: apk.path,
-      apkFilename: apk.filename,
+      publishedAt: resolvePublishedAt(manifest.publishedAt, defaultArtifact.mtime),
+      artifacts,
+      defaultArtifact,
     };
   }
 
+  /**
+   * Legacy single-APK resolution: an explicit `file`, or the only `.apk` in the
+   * version directory. Behavior is unchanged from the pre-ABI implementation.
+   */
   private async resolveApk(
     versionDir: string,
     declared: unknown,
   ): Promise<{ path: string; filename: string; sizeBytes: number; mtime: Date } | null> {
-    let filename: string | null = null;
-
     if (declared === undefined || declared === null || declared === "") {
       let entries: Dirent[];
       try {
@@ -417,14 +477,20 @@ export class AppsService {
         .filter((entry) => entry.isFile() && APK_EXTENSION.test(entry.name))
         .map((entry) => entry.name);
       if (apkNames.length !== 1) return null;
-      filename = apkNames[0] ?? null;
-    } else if (typeof declared === "string" && declared.trim().length > 0) {
-      filename = declared.trim();
-    } else {
-      return null;
+      return this.resolveArtifactFile(versionDir, apkNames[0]);
     }
 
-    if (filename === null || !APK_EXTENSION.test(filename)) return null;
+    if (typeof declared !== "string") return null;
+    const trimmed = declared.trim();
+    if (trimmed.length === 0) return null;
+    return this.resolveArtifactFile(versionDir, trimmed);
+  }
+
+  private async resolveArtifactFile(
+    versionDir: string,
+    filename: string,
+  ): Promise<{ path: string; filename: string; sizeBytes: number; mtime: Date } | null> {
+    if (!APK_EXTENSION.test(filename)) return null;
 
     const resolved = containedPath(versionDir, filename);
     if (resolved === null) return null;
@@ -444,6 +510,88 @@ export class AppsService {
       sizeBytes: stat.size,
       mtime: stat.mtime,
     };
+  }
+
+  /**
+   * Resolves the APK set for one version. An `artifacts` array is authoritative;
+   * otherwise the legacy `file`/single-APK rules apply and the result is one
+   * `universal` artifact. Entries are validated independently: a bad entry logs
+   * a warning and is skipped, and an empty result makes `readVersion` skip the
+   * version.
+   */
+  private async resolveArtifacts(
+    versionDir: string,
+    manifest: Record<string, unknown>,
+  ): Promise<ApkArtifactRecord[]> {
+    const declared = manifest.artifacts;
+
+    if (Array.isArray(declared)) {
+      if (nonBlankString(manifest.file) !== null) {
+        this.logger.warn(
+          { versionDir, file: manifest.file },
+          "ignoring file because artifacts is present",
+        );
+      }
+      if (resolveSha256(manifest.sha256) !== null) {
+        this.logger.warn(
+          { versionDir },
+          "ignoring version-level sha256 because artifacts is present",
+        );
+      }
+
+      const seen = new Set<ApkAbi>();
+      const records: ApkArtifactRecord[] = [];
+      const entries: unknown[] = declared;
+      for (const [index, entry] of entries.entries()) {
+        if (!isPlainObject(entry)) {
+          this.logger.warn({ versionDir, index }, "skipping artifact that is not an object");
+          continue;
+        }
+
+        const abi = normalizeAbi(entry.abi);
+        if (abi === null) {
+          this.logger.warn(
+            { versionDir, index, abi: entry.abi },
+            "skipping artifact with an invalid abi",
+          );
+          continue;
+        }
+        if (seen.has(abi)) {
+          this.logger.warn({ versionDir, index, abi }, "skipping duplicate abi");
+          continue;
+        }
+        seen.add(abi);
+
+        const file = nonBlankString(entry.file);
+        if (file === null) {
+          this.logger.warn({ versionDir, index, abi }, "skipping artifact without a file");
+          continue;
+        }
+
+        const resolved = await this.resolveArtifactFile(versionDir, file);
+        if (resolved === null) {
+          this.logger.warn(
+            { versionDir, index, abi, file },
+            "skipping artifact with an unresolvable file",
+          );
+          continue;
+        }
+
+        records.push({ abi, ...resolved, sha256: resolveSha256(entry.sha256) });
+      }
+
+      return records.sort(
+        (left, right) => ABI_RANK.get(left.abi)! - ABI_RANK.get(right.abi)!,
+      );
+    }
+
+    if (declared !== undefined && declared !== null) {
+      this.logger.warn({ versionDir }, "ignoring non-array artifacts");
+    }
+
+    const apk = await this.resolveApk(versionDir, manifest.file);
+    if (apk === null) return [];
+    return [{ abi: "universal", ...apk, sha256: resolveSha256(manifest.sha256) }];
   }
 
   private async resolveIcon(

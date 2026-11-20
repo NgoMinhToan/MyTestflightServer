@@ -1,3 +1,12 @@
+export type ApkAbi =
+  | "universal"
+  | "arm64-v8a"
+  | "armeabi-v7a"
+  | "x86_64"
+  | "x86"
+  | "riscv64"
+  | "armeabi";
+
 export interface AppManifest {
   schemaVersion: number;
   name: string;
@@ -7,14 +16,30 @@ export interface AppManifest {
   icon: string;
 }
 
+export interface ApkArtifactManifest {
+  abi: string;
+  file: string;
+  sha256?: string | null;
+}
+
 export interface VersionManifest {
   versionCode: number;
-  versionName: string;
-  minSdk: number | null;
-  releaseNotes: string | null;
-  publishedAt: string;
-  file: string;
+  versionName?: string;
+  minSdk?: number | null;
+  releaseNotes?: string | null;
+  publishedAt?: string;
+  file?: string;
+  sha256?: string | null;
+  artifacts?: ApkArtifactManifest[];
+}
+
+export interface ApkArtifactRecord {
+  abi: ApkAbi;
+  path: string;
+  filename: string;
+  sizeBytes: number;
   sha256: string | null;
+  mtime: Date;
 }
 
 export interface VersionRecord {
@@ -23,10 +48,8 @@ export interface VersionRecord {
   minSdk: number | null;
   releaseNotes: string | null;
   publishedAt: string;
-  sizeBytes: number;
-  sha256: string | null;
-  apkPath: string;
-  apkFilename: string;
+  artifacts: ApkArtifactRecord[];
+  defaultArtifact: ApkArtifactRecord;
 }
 
 export interface AppRecord {
@@ -40,6 +63,13 @@ export interface AppRecord {
   versions: VersionRecord[];
 }
 
+export interface ApkArtifactSummary {
+  abi: ApkAbi;
+  sizeBytes: number;
+  sha256: string | null;
+  downloadPath: string;
+}
+
 export interface VersionSummary {
   versionName: string;
   versionCode: number;
@@ -49,6 +79,9 @@ export interface VersionSummary {
   sizeBytes: number;
   sha256: string | null;
   downloadPath: string;
+  abis: ApkAbi[];
+  universal: boolean;
+  artifacts: ApkArtifactSummary[];
 }
 
 export interface AppSummary {
@@ -71,4 +104,9 @@ export interface DownloadRecord {
   fileSize: number;
   sha256: string | null;
   filename: string;
+  abi: ApkAbi;
 }
+
+export type DownloadLookup =
+  | { ok: true; download: DownloadRecord }
+  | { ok: false; reason: "app_not_found" | "version_not_found" | "abi_not_found" };

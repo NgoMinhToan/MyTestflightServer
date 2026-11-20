@@ -36,12 +36,17 @@ async function writeVersion(
   dirName: string,
   manifest: Record<string, unknown>,
   apk: Buffer | null = Buffer.from(`apk-${appId}-${dirName}`),
+  apkFilename = "app.apk",
 ): Promise<string> {
   const versionDir = path.join(appsDir, appId, "versions", dirName);
   await fs.mkdir(versionDir, { recursive: true });
   await fs.writeFile(path.join(versionDir, "version.json"), JSON.stringify(manifest, null, 2));
-  if (apk) await fs.writeFile(path.join(versionDir, "app.apk"), apk);
+  if (apk) await fs.writeFile(path.join(versionDir, apkFilename), apk);
   return versionDir;
+}
+
+async function writeApk(versionDir: string, filename: string, bytes: Buffer): Promise<void> {
+  await fs.writeFile(path.join(versionDir, filename), bytes);
 }
 
 test("creates the apps directory and serves an empty catalog", async (t) => {
@@ -406,4 +411,497 @@ test("returns app_not_found for unknown apps and invalid_request for malformed v
   const malformed = await harness.app.inject("/api/v1/apps/missing/versions/bad%20version/download");
   assert.equal(malformed.statusCode, 400);
   assert.equal((malformed.json() as any).error.code, "invalid_request");
+});
+
+test("exposes declared artifacts and points legacy fields at the universal APK", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "demo", { name: "Demo" });
+  const universal = Buffer.from("universal-bytes");
+  const arm64 = Buffer.from("arm64-bytes-xxxx");
+  const armv7 = Buffer.from("armv7-bytes");
+  const versionDir = await writeVersion(
+    harness.appsDir,
+    "demo",
+    "1.0.0",
+    {
+      versionCode: 1,
+      versionName: "1.0.0",
+      artifacts: [
+        { abi: "arm64-v8a", file: "app-arm64-v8a.apk", sha256: "a".repeat(64) },
+        { abi: "universal", file: "app-universal.apk", sha256: "c".repeat(64) },
+        { abi: "armeabi-v7a", file: "app-armeabi-v7a.apk" },
+      ],
+    },
+    null,
+  );
+  await writeApk(versionDir, "app-arm64-v8a.apk", arm64);
+  await writeApk(versionDir, "app-universal.apk", universal);
+  await writeApk(versionDir, "app-armeabi-v7a.apk", armv7);
+
+  const detail = (await harness.app.inject("/api/v1/apps/demo")).json() as any;
+  const version = detail.app.latestVersion;
+  assert.deepEqual(version.abis, ["universal", "arm64-v8a", "armeabi-v7a"]);
+  assert.equal(version.universal, true);
+  assert.equal(version.artifacts.length, 3);
+  assert.equal(version.sizeBytes, universal.byteLength);
+  assert.equal(version.sha256, "c".repeat(64));
+  assert.equal(version.downloadPath, "/api/v1/apps/demo/versions/1.0.0/download");
+
+  const byAbi = new Map<string, any>(
+    version.artifacts.map((artifact: any) => [artifact.abi, artifact]),
+  );
+  assert.equal(byAbi.get("arm64-v8a").sizeBytes, arm64.byteLength);
+  assert.equal(byAbi.get("arm64-v8a").sha256, "a".repeat(64));
+  assert.equal(
+    byAbi.get("arm64-v8a").downloadPath,
+    "/api/v1/apps/demo/versions/1.0.0/download?abi=arm64-v8a",
+  );
+  assert.equal(byAbi.get("armeabi-v7a").sha256, null);
+
+  const download = await harness.app.inject("/api/v1/apps/demo/versions/1.0.0/download");
+  assert.equal(download.headers["content-disposition"], 'attachment; filename="demo-1.0.0.apk"');
+  assert.deepEqual(download.rawPayload, universal);
+});
+
+test("defaults to the highest-priority ABI when no universal APK exists", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "demo", { name: "Demo" });
+  const arm64 = Buffer.from("arm64-bytes");
+  const armv7 = Buffer.from("armv7-bytes");
+  const x86 = Buffer.from("x86_64-bytes");
+  const versionDir = await writeVersion(
+    harness.appsDir,
+    "demo",
+    "1.0.0",
+    {
+      versionCode: 1,
+      versionName: "1.0.0",
+      artifacts: [
+        { abi: "armeabi-v7a", file: "app-armeabi-v7a.apk" },
+        { abi: "x86_64", file: "app-x86_64.apk" },
+        { abi: "arm64-v8a", file: "app-arm64-v8a.apk", sha256: "d".repeat(64) },
+      ],
+    },
+    null,
+  );
+  await writeApk(versionDir, "app-armeabi-v7a.apk", armv7);
+  await writeApk(versionDir, "app-x86_64.apk", x86);
+  await writeApk(versionDir, "app-arm64-v8a.apk", arm64);
+
+  const detail = (await harness.app.inject("/api/v1/apps/demo")).json() as any;
+  const version = detail.app.latestVersion;
+  assert.deepEqual(version.abis, ["arm64-v8a", "armeabi-v7a", "x86_64"]);
+  assert.equal(version.universal, false);
+  assert.equal(version.sizeBytes, arm64.byteLength);
+  assert.equal(version.sha256, "d".repeat(64));
+
+  const download = await harness.app.inject("/api/v1/apps/demo/versions/1.0.0/download");
+  assert.equal(download.headers["content-disposition"], 'attachment; filename="demo-1.0.0.apk"');
+  assert.deepEqual(download.rawPayload, arm64);
+});
+
+test("downloads a requested ABI with an ABI-suffixed filename", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "demo", { name: "Demo" });
+  const universal = Buffer.from("universal");
+  const arm64 = Buffer.from("arm64-payload");
+  const versionDir = await writeVersion(
+    harness.appsDir,
+    "demo",
+    "1.0.0",
+    {
+      versionCode: 1,
+      versionName: "1.0.0",
+      artifacts: [
+        { abi: "universal", file: "app-universal.apk" },
+        { abi: "arm64-v8a", file: "app-arm64-v8a.apk", sha256: "e".repeat(64) },
+      ],
+    },
+    null,
+  );
+  await writeApk(versionDir, "app-universal.apk", universal);
+  await writeApk(versionDir, "app-arm64-v8a.apk", arm64);
+
+  const response = await harness.app.inject(
+    "/api/v1/apps/demo/versions/1.0.0/download?abi=arm64-v8a",
+  );
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.rawPayload, arm64);
+  assert.equal(
+    response.headers["content-disposition"],
+    'attachment; filename="demo-1.0.0-arm64-v8a.apk"',
+  );
+  assert.equal(response.headers["content-length"], String(arm64.byteLength));
+  assert.equal(response.headers["x-checksum-sha256"], "e".repeat(64));
+});
+
+test("normalizes ABI labels and matches the abi query case-insensitively", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "demo", { name: "Demo" });
+  const arm64 = Buffer.from("arm64-payload");
+  const versionDir = await writeVersion(
+    harness.appsDir,
+    "demo",
+    "1.0.0",
+    {
+      versionCode: 1,
+      versionName: "1.0.0",
+      artifacts: [{ abi: "ARM64-V8A", file: "app-arm64-v8a.apk" }],
+    },
+    null,
+  );
+  await writeApk(versionDir, "app-arm64-v8a.apk", arm64);
+
+  const detail = (await harness.app.inject("/api/v1/apps/demo")).json() as any;
+  assert.deepEqual(detail.app.latestVersion.abis, ["arm64-v8a"]);
+
+  const response = await harness.app.inject(
+    "/api/v1/apps/demo/versions/1.0.0/download?abi=ARM64-V8A",
+  );
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.rawPayload, arm64);
+});
+
+test("requires an exact abi match instead of falling back to universal", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "split", { name: "Split" });
+  const splitDir = await writeVersion(
+    harness.appsDir,
+    "split",
+    "1.0.0",
+    {
+      versionCode: 1,
+      versionName: "1.0.0",
+      artifacts: [
+        { abi: "universal", file: "app-universal.apk" },
+        { abi: "arm64-v8a", file: "app-arm64-v8a.apk" },
+      ],
+    },
+    null,
+  );
+  await writeApk(splitDir, "app-universal.apk", Buffer.from("universal"));
+  await writeApk(splitDir, "app-arm64-v8a.apk", Buffer.from("arm64"));
+
+  const missingSplit = await harness.app.inject(
+    "/api/v1/apps/split/versions/1.0.0/download?abi=x86_64",
+  );
+  assert.equal(missingSplit.statusCode, 404);
+  assert.equal((missingSplit.json() as any).error.code, "abi_not_found");
+
+  await writeAppJson(harness.appsDir, "universal_only", { name: "Universal" });
+  const universalDir = await writeVersion(
+    harness.appsDir,
+    "universal_only",
+    "1.0.0",
+    { versionCode: 1, versionName: "1.0.0", file: "app.apk" },
+    null,
+  );
+  await writeApk(universalDir, "app.apk", Buffer.from("only-universal"));
+
+  const missingUniversal = await harness.app.inject(
+    "/api/v1/apps/universal_only/versions/1.0.0/download?abi=arm64-v8a",
+  );
+  assert.equal(missingUniversal.statusCode, 404);
+  assert.equal((missingUniversal.json() as any).error.code, "abi_not_found");
+
+  const explicitUniversal = await harness.app.inject(
+    "/api/v1/apps/universal_only/versions/1.0.0/download?abi=universal",
+  );
+  assert.equal(explicitUniversal.statusCode, 200);
+  assert.equal(
+    explicitUniversal.headers["content-disposition"],
+    'attachment; filename="universal_only-1.0.0.apk"',
+  );
+});
+
+test("rejects malformed abi queries and treats a blank abi as absent", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "demo", { name: "Demo" });
+  const universal = Buffer.from("universal-bytes");
+  const versionDir = await writeVersion(
+    harness.appsDir,
+    "demo",
+    "1.0.0",
+    {
+      versionCode: 1,
+      versionName: "1.0.0",
+      artifacts: [
+        { abi: "universal", file: "app-universal.apk" },
+        { abi: "arm64-v8a", file: "app-arm64-v8a.apk" },
+      ],
+    },
+    null,
+  );
+  await writeApk(versionDir, "app-universal.apk", universal);
+  await writeApk(versionDir, "app-arm64-v8a.apk", Buffer.from("arm64"));
+
+  const urls = [
+    "/api/v1/apps/demo/versions/1.0.0/download?abi=armv7",
+    "/api/v1/apps/demo/versions/1.0.0/download?abi=arm64-v8a&abi=x86_64",
+  ];
+  for (const url of urls) {
+    const response = await harness.app.inject(url);
+    assert.equal(response.statusCode, 400, url);
+    assert.equal((response.json() as any).error.code, "invalid_request", url);
+  }
+
+  const blank = await harness.app.inject("/api/v1/apps/demo/versions/1.0.0/download?abi=");
+  assert.equal(blank.statusCode, 200);
+  assert.deepEqual(blank.rawPayload, universal);
+});
+
+test("treats a legacy single-APK manifest as a universal artifact", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "demo", { name: "Demo" });
+  const apk = Buffer.from("legacy-bytes");
+  await writeVersion(
+    harness.appsDir,
+    "demo",
+    "1.0.0",
+    { versionCode: 1, versionName: "1.0.0", file: "app.apk", sha256: "F".repeat(64) },
+    apk,
+  );
+
+  const detail = (await harness.app.inject("/api/v1/apps/demo")).json() as any;
+  const version = detail.app.latestVersion;
+  assert.deepEqual(version.abis, ["universal"]);
+  assert.equal(version.universal, true);
+  assert.equal(version.artifacts.length, 1);
+  assert.equal(
+    version.artifacts[0].downloadPath,
+    "/api/v1/apps/demo/versions/1.0.0/download?abi=universal",
+  );
+  assert.equal(version.sha256, "f".repeat(64));
+  assert.equal(version.sizeBytes, apk.byteLength);
+
+  const download = await harness.app.inject("/api/v1/apps/demo/versions/1.0.0/download");
+  assert.equal(download.headers["content-disposition"], 'attachment; filename="demo-1.0.0.apk"');
+  assert.equal(download.headers["x-checksum-sha256"], "f".repeat(64));
+  assert.deepEqual(download.rawPayload, apk);
+});
+
+test("prefers the artifacts array over the legacy file field", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "demo", { name: "Demo" });
+  const versionDir = await writeVersion(
+    harness.appsDir,
+    "demo",
+    "1.0.0",
+    {
+      versionCode: 1,
+      versionName: "1.0.0",
+      file: "ignored.apk",
+      artifacts: [{ abi: "arm64-v8a", file: "app-arm64-v8a.apk" }],
+    },
+    null,
+  );
+  await writeApk(versionDir, "ignored.apk", Buffer.from("ignored"));
+  await writeApk(versionDir, "app-arm64-v8a.apk", Buffer.from("chosen"));
+
+  const detail = (await harness.app.inject("/api/v1/apps/demo")).json() as any;
+  assert.deepEqual(detail.app.latestVersion.abis, ["arm64-v8a"]);
+  assert.equal(detail.app.latestVersion.artifacts.length, 1);
+
+  const download = await harness.app.inject("/api/v1/apps/demo/versions/1.0.0/download");
+  assert.deepEqual(download.rawPayload, Buffer.from("chosen"));
+});
+
+test("skips invalid artifact entries and keeps the valid ones", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "escape", { name: "Escape" });
+  const outside = path.join(harness.dataDir, "outside.apk");
+  await fs.writeFile(outside, Buffer.from("outside"));
+
+  const versionDir = await writeVersion(
+    harness.appsDir,
+    "escape",
+    "1.0.0",
+    {
+      versionCode: 1,
+      versionName: "1.0.0",
+      artifacts: [
+        "not-an-object",
+        { abi: "armv7", file: "app.apk" },
+        { abi: "x86", file: "   " },
+        { abi: "x86_64", file: "../../outside.apk" },
+        { abi: "riscv64", file: outside },
+        { abi: "armeabi", file: "notes.txt" },
+        { abi: "armeabi-v7a", file: "linked.apk" },
+        { abi: "universal", file: "app.apk" },
+        { abi: "universal", file: "other.apk" },
+      ],
+    },
+    null,
+  );
+  const valid = Buffer.from("valid-universal");
+  await writeApk(versionDir, "app.apk", valid);
+  await writeApk(versionDir, "other.apk", Buffer.from("other"));
+  await writeApk(versionDir, "notes.txt", Buffer.from("notes"));
+  await fs.symlink(outside, path.join(versionDir, "linked.apk"));
+
+  const detail = (await harness.app.inject("/api/v1/apps/escape")).json() as any;
+  assert.deepEqual(detail.app.latestVersion.abis, ["universal"]);
+  assert.equal(detail.app.latestVersion.artifacts.length, 1);
+
+  const download = await harness.app.inject("/api/v1/apps/escape/versions/1.0.0/download");
+  assert.deepEqual(download.rawPayload, valid);
+});
+
+test("skips a version when no artifact is resolvable", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "empty", { name: "Empty" });
+  await writeVersion(harness.appsDir, "empty", "bad-abi", {
+    versionCode: 1,
+    versionName: "bad-abi",
+    artifacts: [{ abi: "nope", file: "app.apk" }],
+  });
+  await writeVersion(harness.appsDir, "empty", "empty-list", {
+    versionCode: 2,
+    versionName: "empty-list",
+    file: "app.apk",
+    artifacts: [],
+  });
+
+  const detail = (await harness.app.inject("/api/v1/apps/empty")).json() as any;
+  assert.equal(detail.app.versionCount, 0);
+  assert.equal(detail.app.latestVersion, null);
+});
+
+test("skips versions with several APKs and neither artifacts nor file", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "multi", { name: "Multi" });
+  const versionDir = await writeVersion(
+    harness.appsDir,
+    "multi",
+    "1.0.0",
+    { versionCode: 1, versionName: "1.0.0" },
+    null,
+  );
+  await writeApk(versionDir, "a.apk", Buffer.from("a"));
+  await writeApk(versionDir, "b.apk", Buffer.from("b"));
+
+  const detail = (await harness.app.inject("/api/v1/apps/multi")).json() as any;
+  assert.equal(detail.app.versionCount, 0);
+  assert.equal(detail.app.latestVersion, null);
+});
+
+test("uses the default artifact mtime when publishedAt is invalid", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "dated", { name: "Dated" });
+  const versionDir = await writeVersion(
+    harness.appsDir,
+    "dated",
+    "1.0.0",
+    {
+      versionCode: 1,
+      versionName: "1.0.0",
+      publishedAt: "not-a-date",
+      artifacts: [
+        { abi: "arm64-v8a", file: "app-arm64-v8a.apk" },
+        { abi: "armeabi-v7a", file: "app-armeabi-v7a.apk" },
+      ],
+    },
+    null,
+  );
+  await writeApk(versionDir, "app-arm64-v8a.apk", Buffer.from("arm64"));
+  await writeApk(versionDir, "app-armeabi-v7a.apk", Buffer.from("armv7"));
+  await fs.utimes(
+    path.join(versionDir, "app-arm64-v8a.apk"),
+    new Date("2020-01-01T00:00:00.000Z"),
+    new Date("2020-01-01T00:00:00.000Z"),
+  );
+  await fs.utimes(
+    path.join(versionDir, "app-armeabi-v7a.apk"),
+    new Date("2021-01-01T00:00:00.000Z"),
+    new Date("2021-01-01T00:00:00.000Z"),
+  );
+
+  const detail = (await harness.app.inject("/api/v1/apps/dated")).json() as any;
+  const expected = (await fs.stat(path.join(versionDir, "app-arm64-v8a.apk"))).mtime.toISOString();
+  assert.equal(detail.app.latestVersion.publishedAt, expected);
+});
+
+test("uses per-artifact digests and ignores the version-level sha256", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "checks", { name: "Checks" });
+  const versionDir = await writeVersion(
+    harness.appsDir,
+    "checks",
+    "1.0.0",
+    {
+      versionCode: 1,
+      versionName: "1.0.0",
+      sha256: "B".repeat(64),
+      artifacts: [
+        { abi: "arm64-v8a", file: "app-arm64-v8a.apk", sha256: "A".repeat(64) },
+        { abi: "universal", file: "app-universal.apk", sha256: "abc123" },
+      ],
+    },
+    null,
+  );
+  await writeApk(versionDir, "app-arm64-v8a.apk", Buffer.from("arm64"));
+  await writeApk(versionDir, "app-universal.apk", Buffer.from("universal"));
+
+  const detail = (await harness.app.inject("/api/v1/apps/checks")).json() as any;
+  const byAbi = new Map<string, any>(
+    detail.app.latestVersion.artifacts.map((artifact: any) => [artifact.abi, artifact]),
+  );
+  assert.equal(byAbi.get("arm64-v8a").sha256, "a".repeat(64));
+  assert.equal(byAbi.get("universal").sha256, null);
+  assert.equal(detail.app.latestVersion.sha256, null);
+
+  const arm64 = await harness.app.inject(
+    "/api/v1/apps/checks/versions/1.0.0/download?abi=arm64-v8a",
+  );
+  assert.equal(arm64.headers["x-checksum-sha256"], "a".repeat(64));
+  const universal = await harness.app.inject(
+    "/api/v1/apps/checks/versions/1.0.0/download?abi=universal",
+  );
+  assert.equal(universal.headers["x-checksum-sha256"], undefined);
+});
+
+test("reports app and version not-found before abi availability", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "demo", { name: "Demo" });
+  await writeVersion(harness.appsDir, "demo", "1.0.0", {
+    versionCode: 1,
+    versionName: "1.0.0",
+  });
+
+  const unknownApp = await harness.app.inject(
+    "/api/v1/apps/missing/versions/1.0.0/download?abi=x86_64",
+  );
+  assert.equal(unknownApp.statusCode, 404);
+  assert.equal((unknownApp.json() as any).error.code, "app_not_found");
+
+  const unknownVersion = await harness.app.inject(
+    "/api/v1/apps/demo/versions/9.9.9/download?abi=x86_64",
+  );
+  assert.equal(unknownVersion.statusCode, 404);
+  assert.equal((unknownVersion.json() as any).error.code, "version_not_found");
+});
+
+test("falls back to the legacy file when artifacts is not an array", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "demo", { name: "Demo" });
+  const versionDir = await writeVersion(
+    harness.appsDir,
+    "demo",
+    "1.0.0",
+    {
+      versionCode: 1,
+      versionName: "1.0.0",
+      file: "app.apk",
+      artifacts: { abi: "arm64-v8a", file: "app.apk" },
+    },
+    null,
+  );
+  await writeApk(versionDir, "app.apk", Buffer.from("legacy"));
+
+  const detail = (await harness.app.inject("/api/v1/apps/demo")).json() as any;
+  assert.deepEqual(detail.app.latestVersion.abis, ["universal"]);
+  assert.equal(detail.app.latestVersion.universal, true);
+
+  const download = await harness.app.inject("/api/v1/apps/demo/versions/1.0.0/download");
+  assert.deepEqual(download.rawPayload, Buffer.from("legacy"));
 });

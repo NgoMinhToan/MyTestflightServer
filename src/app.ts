@@ -1,8 +1,9 @@
 import { createReadStream } from "node:fs";
 import Fastify, { type FastifyError, type FastifyInstance } from "fastify";
-import { AppsService, ID_PATTERN } from "./apps-service";
+import { AppsService, ID_PATTERN, normalizeAbi } from "./apps-service";
 import type { Config } from "./config";
 import { HttpError, sendError } from "./http-errors";
+import type { ApkAbi } from "./types";
 
 export interface BuildAppOptions {
   logger?: boolean | { level: string };
@@ -13,6 +14,20 @@ function requireValidId(value: string, label: string): string {
     throw new HttpError(400, "invalid_request", `Invalid ${label}`);
   }
   return value;
+}
+
+function parseAbiQuery(value: unknown): ApkAbi | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") {
+    throw new HttpError(400, "invalid_request", "Invalid abi");
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return undefined;
+  const abi = normalizeAbi(trimmed);
+  if (abi === null) {
+    throw new HttpError(400, "invalid_request", `Invalid abi "${trimmed}"`);
+  }
+  return abi;
 }
 
 export function buildApp(config: Config, options: BuildAppOptions = {}): FastifyInstance {
@@ -59,17 +74,32 @@ export function buildApp(config: Config, options: BuildAppOptions = {}): Fastify
     return reply.send(createReadStream(icon.path));
   });
 
-  app.get<{ Params: { appId: string; versionName: string } }>(
+  app.get<{
+    Params: { appId: string; versionName: string };
+    Querystring: { abi?: unknown };
+  }>(
     "/api/v1/apps/:appId/versions/:versionName/download",
     async (request, reply) => {
       const appId = requireValidId(request.params.appId, "app id");
       const versionName = requireValidId(request.params.versionName, "version name");
-      const download = await service.getDownload(appId, versionName);
-      if (!download) {
-        const detail = await service.getApp(appId);
-        if (!detail) throw new HttpError(404, "app_not_found", `Unknown app "${appId}"`);
-        throw new HttpError(404, "version_not_found", `Unknown version "${versionName}"`);
+      const abi = parseAbiQuery(request.query.abi);
+
+      const lookup = await service.getDownload(appId, versionName, abi);
+      if (!lookup.ok) {
+        if (lookup.reason === "app_not_found") {
+          throw new HttpError(404, "app_not_found", `Unknown app "${appId}"`);
+        }
+        if (lookup.reason === "version_not_found") {
+          throw new HttpError(404, "version_not_found", `Unknown version "${versionName}"`);
+        }
+        throw new HttpError(
+          404,
+          "abi_not_found",
+          `Version "${versionName}" has no APK for ABI "${abi}"`,
+        );
       }
+
+      const download = lookup.download;
       reply.header("Content-Type", "application/vnd.android.package-archive");
       reply.header("Content-Disposition", `attachment; filename="${download.filename}"`);
       reply.header("Content-Length", String(download.fileSize));
