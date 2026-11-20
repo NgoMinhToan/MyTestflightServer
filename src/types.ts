@@ -70,6 +70,45 @@ export interface ApkArtifactSummary {
   downloadPath: string;
 }
 
+export interface VersionAdminArtifact extends ApkArtifactSummary {
+  /** Server-owned file name inside the version directory. */
+  filename: string;
+}
+
+/**
+ * Admin representation of a version. Unlike `VersionSummary` it tolerates an
+ * empty artifact set, so a version created before its first APK upload is
+ * visible through the write API (a "draft") but not through the public catalog.
+ */
+export interface VersionAdmin {
+  versionName: string;
+  versionCode: number;
+  minSdk: number | null;
+  releaseNotes: string | null;
+  publishedAt: string;
+  draft: boolean;
+  abis: ApkAbi[];
+  universal: boolean;
+  artifacts: VersionAdminArtifact[];
+  defaultArtifact: VersionAdminArtifact | null;
+  sizeBytes: number | null;
+  sha256: string | null;
+  downloadPath: string | null;
+}
+
+/** Parsed version manifest plus its resolved artifacts, used by the writer. */
+export interface VersionEntry {
+  dir: string;
+  dirName: string;
+  manifest: Record<string, unknown>;
+  versionName: string;
+  versionCode: number;
+  minSdk: number | null;
+  releaseNotes: string | null;
+  publishedAt: string;
+  artifacts: ApkArtifactRecord[];
+}
+
 export interface VersionSummary {
   versionName: string;
   versionCode: number;

@@ -1,38 +1,48 @@
 import { createReadStream } from "node:fs";
 import Fastify, { type FastifyError, type FastifyInstance } from "fastify";
-import { AppsService, ID_PATTERN, normalizeAbi } from "./apps-service";
+import { registerAdminRoutes } from "./admin-routes";
+import { AppsService } from "./apps-service";
+import { AppsWriter } from "./apps-writer";
 import type { Config } from "./config";
 import { HttpError, sendError } from "./http-errors";
-import type { ApkAbi } from "./types";
+import { parseAbiQuery, requireValidId } from "./params";
 
 export interface BuildAppOptions {
   logger?: boolean | { level: string };
 }
 
-function requireValidId(value: string, label: string): string {
-  if (!ID_PATTERN.test(value)) {
-    throw new HttpError(400, "invalid_request", `Invalid ${label}`);
-  }
-  return value;
-}
-
-function parseAbiQuery(value: unknown): ApkAbi | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string") {
-    throw new HttpError(400, "invalid_request", "Invalid abi");
-  }
-  const trimmed = value.trim();
-  if (trimmed.length === 0) return undefined;
-  const abi = normalizeAbi(trimmed);
-  if (abi === null) {
-    throw new HttpError(400, "invalid_request", `Invalid abi "${trimmed}"`);
-  }
-  return abi;
-}
+const FASTIFY_ERROR_MAP: Record<string, { status: number; code: string; message: string }> = {
+  FST_ERR_CTP_BODY_TOO_LARGE: {
+    status: 413,
+    code: "payload_too_large",
+    message: "Request body is too large",
+  },
+  FST_ERR_CTP_INVALID_MEDIA_TYPE: {
+    status: 415,
+    code: "unsupported_media_type",
+    message: "Unsupported content type",
+  },
+  FST_ERR_CTP_EMPTY_JSON_BODY: {
+    status: 400,
+    code: "invalid_request",
+    message: "Request body is empty",
+  },
+  FST_ERR_CTP_INVALID_JSON_BODY: {
+    status: 400,
+    code: "invalid_request",
+    message: "Invalid JSON body",
+  },
+  FST_ERR_CTP_INVALID_CONTENT_LENGTH: {
+    status: 400,
+    code: "invalid_request",
+    message: "Invalid content length",
+  },
+};
 
 export function buildApp(config: Config, options: BuildAppOptions = {}): FastifyInstance {
   const app = Fastify({ logger: options.logger ?? { level: config.logLevel } });
   const service = new AppsService(config, app.log);
+  const writer = new AppsWriter(config, app.log, service);
 
   app.addHook("onReady", async () => {
     try {
@@ -70,6 +80,7 @@ export function buildApp(config: Config, options: BuildAppOptions = {}): Fastify
     const icon = await service.getIcon(appId);
     if (!icon) throw new HttpError(404, "icon_not_found", `No icon for app "${appId}"`);
     reply.header("cache-control", "public, max-age=60");
+    reply.header("x-content-type-options", "nosniff");
     reply.type(icon.contentType);
     return reply.send(createReadStream(icon.path));
   });
@@ -109,6 +120,8 @@ export function buildApp(config: Config, options: BuildAppOptions = {}): Fastify
     },
   );
 
+  app.register(registerAdminRoutes, { config, service, writer });
+
   app.setNotFoundHandler((_request, reply) => {
     sendError(reply, 404, "not_found", "Route not found");
   });
@@ -116,6 +129,11 @@ export function buildApp(config: Config, options: BuildAppOptions = {}): Fastify
   app.setErrorHandler((error: FastifyError, request, reply) => {
     if (error instanceof HttpError) {
       sendError(reply, error.statusCode, error.code, error.message);
+      return;
+    }
+    const mapped = FASTIFY_ERROR_MAP[error.code];
+    if (mapped) {
+      sendError(reply, mapped.status, mapped.code, mapped.message);
       return;
     }
     const statusCode = error.statusCode;

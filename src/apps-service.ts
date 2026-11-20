@@ -6,43 +6,38 @@ import type { Config } from "./config";
 import type {
   ApkAbi,
   ApkArtifactRecord,
+  ApkArtifactSummary,
   AppDetail,
   AppManifest,
   AppRecord,
   AppSummary,
   DownloadLookup,
+  VersionAdmin,
+  VersionAdminArtifact,
+  VersionEntry,
   VersionRecord,
   VersionSummary,
 } from "./types";
-
-export const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
-const APK_EXTENSION = /\.apk$/i;
-const DEFAULT_ICON = "app_icon.png";
-
-/**
- * Supported ABI labels in display/priority order. `universal` first means it is
- * always the default artifact when present; the rest follow Android's current
- * device distribution so a split-only version still defaults to the most common
- * architecture.
- */
-export const ABI_PRIORITY: readonly ApkAbi[] = [
-  "universal",
-  "arm64-v8a",
-  "armeabi-v7a",
-  "x86_64",
-  "x86",
-  "riscv64",
-  "armeabi",
-];
-const ABI_RANK = new Map<ApkAbi, number>(ABI_PRIORITY.map((abi, index) => [abi, index]));
-const ABI_SET = new Set<string>(ABI_PRIORITY);
-
-export function normalizeAbi(value: unknown): ApkAbi | null {
-  if (typeof value !== "string") return null;
-  const normalized = value.trim().toLowerCase();
-  return ABI_SET.has(normalized) ? (normalized as ApkAbi) : null;
-}
+import {
+  APK_EXTENSION,
+  ID_PATTERN,
+  compareAbi,
+  containedPath,
+  defaultAppManifest,
+  errorMessage,
+  isNotFound,
+  isPlainObject,
+  isProvisioned,
+  nonBlankString,
+  normalizeAbi,
+  normalizeAppManifest,
+  readRegularJsonFile,
+  readRegularJsonFileWithMtime,
+  resolveAppDir,
+  resolvePublishedAt,
+  resolveSha256,
+  writeJsonExclusive,
+} from "./volume";
 
 const ICON_CONTENT_TYPES: Record<string, string> = {
   ".png": "image/png",
@@ -52,106 +47,6 @@ const ICON_CONTENT_TYPES: Record<string, string> = {
 };
 
 const collator = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
-
-function errorCode(error: unknown): string | undefined {
-  return (error as NodeJS.ErrnoException | undefined)?.code;
-}
-
-function isNotFound(error: unknown): boolean {
-  const code = errorCode(error);
-  return code === "ENOENT" || code === "ENOTDIR";
-}
-
-function isProvisioned(error: unknown): boolean {
-  const code = errorCode(error);
-  return code === "EEXIST" || code === "EISDIR" || code === "ENOTDIR";
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function nonBlankString(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function humanizeAppId(id: string): string {
-  const parts = id.split(/[-_.]+/).filter((part) => part.length > 0);
-  const name = parts
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-  return name || id;
-}
-
-function defaultAppManifest(id: string): AppManifest {
-  return {
-    schemaVersion: 1,
-    name: humanizeAppId(id),
-    packageName: id,
-    description: "",
-    developer: "",
-    icon: DEFAULT_ICON,
-  };
-}
-
-function normalizeAppManifest(value: unknown, id: string): AppManifest {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("app.json must contain a JSON object");
-  }
-  const record = value as Record<string, unknown>;
-  return {
-    schemaVersion:
-      typeof record.schemaVersion === "number" && Number.isFinite(record.schemaVersion)
-        ? record.schemaVersion
-        : 1,
-    name: nonBlankString(record.name) ?? humanizeAppId(id),
-    packageName: nonBlankString(record.packageName) ?? id,
-    description: typeof record.description === "string" ? record.description : "",
-    developer: typeof record.developer === "string" ? record.developer : "",
-    icon: nonBlankString(record.icon) ?? DEFAULT_ICON,
-  };
-}
-
-/**
- * Resolves `candidate` inside `base`, rejecting absolute paths and anything
- * that escapes `base` (including `..` segments).
- */
-function containedPath(base: string, candidate: string): string | null {
-  if (candidate.length === 0 || path.isAbsolute(candidate)) return null;
-  const resolved = path.resolve(base, candidate);
-  const relative = path.relative(base, resolved);
-  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return null;
-  return resolved;
-}
-
-function resolvePublishedAt(value: unknown, mtime: Date): string {
-  if (typeof value === "string" && value.trim().length > 0) {
-    const date = new Date(value);
-    if (!Number.isNaN(date.getTime())) return date.toISOString();
-  }
-  return mtime.toISOString();
-}
-
-function resolveSha256(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const normalized = value.trim();
-  return SHA256_PATTERN.test(normalized) ? normalized.toLowerCase() : null;
-}
-
-async function readRegularJsonFile(file: string): Promise<unknown> {
-  const stat = await fs.lstat(file);
-  if (!stat.isFile()) throw new Error(`${path.basename(file)} is not a regular file`);
-  const text = await fs.readFile(file, "utf8");
-  return JSON.parse(text);
-}
-
-async function writeJsonExclusive(file: string, value: unknown): Promise<void> {
-  await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx" });
-}
 
 export class AppsService {
   constructor(
@@ -254,6 +149,43 @@ export class AppsService {
     };
   }
 
+  async listVersionsAdmin(appId: string): Promise<VersionAdmin[] | null> {
+    const appDir = await this.adminAppDir(appId);
+    if (!appDir) return null;
+    const entries = await this.readVersionEntries(appId, path.join(appDir, "versions"));
+    return entries
+      .map((entry) => this.toVersionAdmin(appId, entry))
+      .sort(
+        (left, right) =>
+          right.versionCode - left.versionCode ||
+          collator.compare(right.versionName, left.versionName),
+      );
+  }
+
+  async getVersionAdmin(appId: string, versionName: string): Promise<VersionAdmin | null> {
+    const entry = await this.getVersionEntry(appId, versionName);
+    return entry ? this.toVersionAdmin(appId, entry) : null;
+  }
+
+  async getVersionEntry(appId: string, versionName: string): Promise<VersionEntry | null> {
+    const appDir = await this.adminAppDir(appId);
+    if (!appDir) return null;
+    const entries = await this.readVersionEntries(appId, path.join(appDir, "versions"));
+    return entries.find((entry) => entry.versionName === versionName) ?? null;
+  }
+
+  private async adminAppDir(appId: string): Promise<string | null> {
+    const appDir = await resolveAppDir(path.join(this.config.dataDir, "apps"), appId);
+    if (!appDir) return null;
+    try {
+      await this.readOrCreateAppManifest(appDir, appId);
+    } catch (error) {
+      this.logger.warn({ err: error, appId }, "app manifest is unreadable");
+      return null;
+    }
+    return appDir;
+  }
+
   private toSummary(record: AppRecord): AppSummary {
     const latest = record.versions[0];
     return {
@@ -282,12 +214,40 @@ export class AppsService {
       downloadPath: base,
       abis: version.artifacts.map((artifact) => artifact.abi),
       universal: version.artifacts.some((artifact) => artifact.abi === "universal"),
-      artifacts: version.artifacts.map((artifact) => ({
-        abi: artifact.abi,
-        sizeBytes: artifact.sizeBytes,
-        sha256: artifact.sha256,
-        downloadPath: `${base}?abi=${encodeURIComponent(artifact.abi)}`,
-      })),
+      artifacts: version.artifacts.map((artifact) => this.toArtifactSummary(base, artifact)),
+    };
+  }
+
+  private toArtifactSummary(base: string, artifact: ApkArtifactRecord): ApkArtifactSummary {
+    return {
+      abi: artifact.abi,
+      sizeBytes: artifact.sizeBytes,
+      sha256: artifact.sha256,
+      downloadPath: `${base}?abi=${encodeURIComponent(artifact.abi)}`,
+    };
+  }
+
+  toVersionAdmin(appId: string, entry: VersionEntry): VersionAdmin {
+    const base = `/api/v1/apps/${appId}/versions/${entry.versionName}/download`;
+    const artifacts: VersionAdminArtifact[] = entry.artifacts.map((artifact) => ({
+      ...this.toArtifactSummary(base, artifact),
+      filename: artifact.filename,
+    }));
+    const defaultArtifact = artifacts[0] ?? null;
+    return {
+      versionName: entry.versionName,
+      versionCode: entry.versionCode,
+      minSdk: entry.minSdk,
+      releaseNotes: entry.releaseNotes,
+      publishedAt: entry.publishedAt,
+      draft: artifacts.length === 0,
+      abis: entry.artifacts.map((artifact) => artifact.abi),
+      universal: entry.artifacts.some((artifact) => artifact.abi === "universal"),
+      artifacts,
+      defaultArtifact,
+      sizeBytes: defaultArtifact?.sizeBytes ?? null,
+      sha256: defaultArtifact?.sha256 ?? null,
+      downloadPath: defaultArtifact ? base : null,
     };
   }
 
@@ -297,44 +257,33 @@ export class AppsService {
 
     const versionsDir = path.join(appDir, "versions");
     await this.ensureVersionsDir(versionsDir);
-
-    let versionEntries: Dirent[] = [];
-    try {
-      versionEntries = await fs.readdir(versionsDir, { withFileTypes: true });
-    } catch (error) {
-      if (!isNotFound(error)) {
-        this.logger.warn({ err: error, appId: id }, "could not read versions directory");
-      }
-    }
-
-    const versionDirs = versionEntries
-      .filter((entry) => entry.isDirectory() && ID_PATTERN.test(entry.name))
-      .map((entry) => entry.name)
-      .sort((left, right) => left.localeCompare(right));
+    const entries = await this.readVersionEntries(id, versionsDir);
 
     const versions: VersionRecord[] = [];
-    const seenVersionNames = new Set<string>();
-    for (const dirName of versionDirs) {
-      let version: VersionRecord | null;
-      try {
-        version = await this.readVersion(path.join(versionsDir, dirName), dirName);
-      } catch (error) {
-        this.logger.warn(
-          { err: error, appId: id, versionDir: dirName },
-          "skipping unreadable version",
-        );
+    for (const entry of entries) {
+      if (entry.artifacts.length === 0) {
+        if (Array.isArray(entry.manifest.artifacts)) {
+          this.logger.debug(
+            { appId: id, versionDir: entry.dirName },
+            "skipping draft version without an APK",
+          );
+        } else {
+          this.logger.warn(
+            { appId: id, versionDir: entry.dirName },
+            "skipping version without a resolvable APK",
+          );
+        }
         continue;
       }
-      if (!version) continue;
-      if (seenVersionNames.has(version.versionName)) {
-        this.logger.warn(
-          { appId: id, versionDir: dirName, versionName: version.versionName },
-          "skipping duplicate versionName",
-        );
-        continue;
-      }
-      seenVersionNames.add(version.versionName);
-      versions.push(version);
+      versions.push({
+        versionName: entry.versionName,
+        versionCode: entry.versionCode,
+        minSdk: entry.minSdk,
+        releaseNotes: entry.releaseNotes,
+        publishedAt: entry.publishedAt,
+        artifacts: entry.artifacts,
+        defaultArtifact: entry.artifacts[0],
+      });
     }
 
     versions.sort(
@@ -394,18 +343,66 @@ export class AppsService {
     }
   }
 
-  private async readVersion(versionDir: string, dirName: string): Promise<VersionRecord | null> {
-    let raw: unknown;
+  private async readVersionEntries(
+    appId: string,
+    versionsDir: string,
+  ): Promise<VersionEntry[]> {
+    let entries: Dirent[] = [];
     try {
-      raw = await readRegularJsonFile(path.join(versionDir, "version.json"));
+      entries = await fs.readdir(versionsDir, { withFileTypes: true });
+    } catch (error) {
+      if (!isNotFound(error)) {
+        this.logger.warn({ err: error, appId }, "could not read versions directory");
+      }
+    }
+
+    const dirNames = entries
+      .filter((entry) => entry.isDirectory() && ID_PATTERN.test(entry.name))
+      .map((entry) => entry.name)
+      .sort((left, right) => left.localeCompare(right));
+
+    const versions: VersionEntry[] = [];
+    const seenVersionNames = new Set<string>();
+    for (const dirName of dirNames) {
+      let version: VersionEntry | null;
+      try {
+        version = await this.readVersionEntry(path.join(versionsDir, dirName), dirName);
+      } catch (error) {
+        this.logger.warn(
+          { err: error, appId, versionDir: dirName },
+          "skipping unreadable version",
+        );
+        continue;
+      }
+      if (!version) continue;
+      if (seenVersionNames.has(version.versionName)) {
+        this.logger.warn(
+          { appId, versionDir: dirName, versionName: version.versionName },
+          "skipping duplicate versionName",
+        );
+        continue;
+      }
+      seenVersionNames.add(version.versionName);
+      versions.push(version);
+    }
+    return versions;
+  }
+
+  private async readVersionEntry(
+    versionDir: string,
+    dirName: string,
+  ): Promise<VersionEntry | null> {
+    let json: { value: unknown; mtime: Date };
+    try {
+      json = await readRegularJsonFileWithMtime(path.join(versionDir, "version.json"));
     } catch (error) {
       if (isNotFound(error)) return null;
       throw error;
     }
-    if (!isPlainObject(raw)) {
+    if (!isPlainObject(json.value)) {
       throw new Error("version.json must contain a JSON object");
     }
-    const manifest = raw;
+    const manifest = json.value;
 
     const versionCode = manifest.versionCode;
     if (
@@ -434,12 +431,6 @@ export class AppsService {
     }
 
     const artifacts = await this.resolveArtifacts(versionDir, manifest);
-    if (artifacts.length === 0) {
-      this.logger.warn({ versionDir }, "skipping version without a resolvable APK");
-      return null;
-    }
-    const defaultArtifact = artifacts[0];
-
     const minSdkValue = manifest.minSdk;
     const minSdk =
       typeof minSdkValue === "number" && Number.isInteger(minSdkValue) && minSdkValue > 0
@@ -447,13 +438,18 @@ export class AppsService {
         : null;
 
     return {
+      dir: versionDir,
+      dirName,
+      manifest,
       versionName,
       versionCode,
       minSdk,
       releaseNotes: typeof manifest.releaseNotes === "string" ? manifest.releaseNotes : null,
-      publishedAt: resolvePublishedAt(manifest.publishedAt, defaultArtifact.mtime),
+      publishedAt: resolvePublishedAt(
+        manifest.publishedAt,
+        artifacts.length > 0 ? artifacts[0].mtime : json.mtime,
+      ),
       artifacts,
-      defaultArtifact,
     };
   }
 
@@ -580,9 +576,7 @@ export class AppsService {
         records.push({ abi, ...resolved, sha256: resolveSha256(entry.sha256) });
       }
 
-      return records.sort(
-        (left, right) => ABI_RANK.get(left.abi)! - ABI_RANK.get(right.abi)!,
-      );
+      return records.sort((left, right) => compareAbi(left.abi, right.abi));
     }
 
     if (declared !== undefined && declared !== null) {
