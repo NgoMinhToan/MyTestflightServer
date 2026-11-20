@@ -312,6 +312,34 @@ image (`linux/amd64`, `linux/arm64`, `linux/arm/v7`, `linux/arm/v6`) to
 `ghcr.io/<lowercase-owner>/<lowercase-repo>`. Pull requests build without pushing; `latest` is
 published only from the default branch.
 
+## Browser dashboard (CORS)
+
+`MyTestflightDashboard/` is a static dashboard designed for GitHub Pages. It runs on a different
+origin from this API, so the browser needs CORS. CORS is **disabled by default**; opt in with
+`CORS_ORIGINS` (comma-separated origins, or `*`):
+
+```bash
+# Only the GitHub Pages origin for the dashboard repo.
+CORS_ORIGINS=https://<owner>.github.io npm start
+
+# Local Vite dev server alongside Pages.
+CORS_ORIGINS=https://<owner>.github.io,http://localhost:5173 npm run dev
+
+# Any origin (trusted network; writes still require X-Management-Key).
+CORS_ORIGINS='*'
+```
+
+- Entries are scheme + host + port only. Paths, queries and credentials are rejected at startup; a
+  trailing `/` is tolerated and normalized.
+- Preflight requests are answered with `204` and allow `content-type` and `x-management-key` on
+  `GET`, `HEAD`, `POST`, `PUT`, `DELETE` and `OPTIONS`. Chrome's
+  `Access-Control-Allow-Private-Network` request is echoed.
+- CORS does not relax the write API: `X-Management-Key` is still required for every mutation, and
+  read routes were already public. Keep both the server and the dashboard on a trusted network.
+- An HTTPS dashboard cannot call a plain-HTTP private server (mixed content). Use HTTPS for the
+  server or run the dashboard over HTTP during development. `http://localhost` is treated specially
+  by browsers and is allowed for local testing.
+
 ## Environment
 
 | Variable | Default | Notes |
@@ -321,6 +349,7 @@ published only from the default branch.
 | `DATA_DIR` | `./data` | Volume root |
 | `LOG_LEVEL` | `info` | Pino level |
 | `MAX_APK_BYTES` | `536870912` | Maximum size of one APK upload |
+| `CORS_ORIGINS` | *(empty)* | Comma-separated allowed browser origins, or `*`; empty disables CORS |
 
 `$DATA_DIR/config.json` is file-based configuration (`management_key`), not an environment variable.
 It is created on first start and read fresh on every write request.

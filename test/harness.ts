@@ -57,6 +57,7 @@ export async function createHarness(
     dataDir,
     logLevel: "silent",
     maxApkBytes: 1024 * 1024,
+    corsOrigins: [],
     ...overrides,
   };
   const configPath = path.join(config.dataDir, "config.json");

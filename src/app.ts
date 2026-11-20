@@ -40,8 +40,40 @@ const FASTIFY_ERROR_MAP: Record<string, { status: number; code: string; message:
   },
 };
 
+function registerCors(app: FastifyInstance, origins: string[]): void {
+  if (origins.length === 0) return;
+  const allowAll = origins.includes("*");
+  const allowed = new Set(origins.filter((origin) => origin !== "*"));
+  const methods = "GET,HEAD,POST,PUT,DELETE,OPTIONS";
+  const headers = "content-type,x-management-key";
+
+  app.addHook("onRequest", async (request, reply) => {
+    const origin = request.headers.origin;
+    if (typeof origin !== "string" || origin.length === 0) return;
+    if (!allowAll && !allowed.has(origin)) return;
+
+    reply.header("access-control-allow-origin", allowAll ? "*" : origin);
+    if (!allowAll) reply.header("vary", "Origin");
+    reply.header(
+      "access-control-expose-headers",
+      "content-disposition,x-checksum-sha256",
+    );
+
+    if (request.method === "OPTIONS") {
+      reply.header("access-control-allow-methods", methods);
+      reply.header("access-control-allow-headers", headers);
+      reply.header("access-control-max-age", "86400");
+      if (request.headers["access-control-request-private-network"] === "true") {
+        reply.header("access-control-allow-private-network", "true");
+      }
+      reply.code(204).send();
+    }
+  });
+}
+
 export function buildApp(config: Config, options: BuildAppOptions = {}): FastifyInstance {
   const app = Fastify({ logger: options.logger ?? { level: config.logLevel } });
+  registerCors(app, config.corsOrigins);
   const service = new AppsService(config, app.log);
   const writer = new AppsWriter(config, app.log, service);
 

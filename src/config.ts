@@ -6,6 +6,12 @@ export interface Config {
   dataDir: string;
   logLevel: string;
   maxApkBytes: number;
+  /**
+   * Allowed browser origins for the dashboard. Empty disables CORS entirely.
+   * `"*"` allows any origin; otherwise entries are normalized origins such as
+   * `https://owner.github.io`.
+   */
+  corsOrigins: string[];
 }
 
 const DEFAULT_PORT = 8080;
@@ -28,6 +34,35 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const dataDir = path.resolve(env.DATA_DIR?.trim() || "./data");
   const logLevel = env.LOG_LEVEL?.trim() || "info";
+  const corsOrigins = parseCorsOrigins(env.CORS_ORIGINS);
 
-  return { host, port, dataDir, logLevel, maxApkBytes };
+  return { host, port, dataDir, logLevel, maxApkBytes, corsOrigins };
+}
+
+function parseCorsOrigins(raw: string | undefined): string[] {
+  const value = raw?.trim();
+  if (!value) return [];
+  const origins = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => {
+      if (entry === "*") return "*";
+      let url: URL;
+      try {
+        url = new URL(entry);
+      } catch {
+        throw new Error(`Invalid CORS_ORIGINS entry "${entry}": expected an origin`);
+      }
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        throw new Error(`Invalid CORS_ORIGINS entry "${entry}": expected http(s)`);
+      }
+      if (url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+        throw new Error(
+          `Invalid CORS_ORIGINS entry "${entry}": use an origin without a path`,
+        );
+      }
+      return url.origin;
+    });
+  return [...new Set(origins)];
 }
