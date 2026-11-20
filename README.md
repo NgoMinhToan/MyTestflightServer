@@ -3,9 +3,10 @@
 Internal Android app distribution service. Node 22 + TypeScript + Fastify 5.
 
 > **Warning**
-> The write endpoints are unauthenticated. Anyone who can reach the server can create, replace,
-> and delete apps and APKs. Run it on a trusted network or behind a reverse proxy, and do not
-> expose it to the public internet.
+> Read routes are public. Write routes require an `X-Management-Key` header matching
+> `management_key` in `$DATA_DIR/config.json`; without it they return 401, and when the key is not
+> configured they return 503. The key is stored in plaintext in the mounted volume, so use a
+> trusted network or TLS and keep the volume private.
 
 ## Layout
 
@@ -17,14 +18,16 @@ src/
 ├── apps-service.ts  # volume scan, version resolution, read model
 ├── apps-writer.ts   # app/version/artifact/icon mutations, streaming upload
 ├── admin-routes.ts  # write routes and upload content-type parsers
+├── management-config.ts # $DATA_DIR/config.json creation and key checks
 ├── params.ts        # id/abi request validation
 ├── http-errors.ts   # HttpError + sendError
 ├── app.ts           # Fastify factory, read routes, error handling
 └── main.ts          # listen + graceful shutdown
 test/
-├── harness.ts       # temp-volume harness and fixtures
+├── harness.ts       # temp-volume harness, fixtures, auth headers
 ├── apps.test.ts     # 30 read cases
-└── admin.test.ts    # 18 write cases
+├── admin.test.ts    # 18 write cases
+└── management-key.test.ts # 8 auth/config cases
 Dockerfile
 docker-entrypoint.sh
 .github/workflows/build-image.yml
@@ -47,6 +50,7 @@ use `DATA_DIR=../data` to serve the workspace volume.
 ## Volume
 
 ```text
+$DATA_DIR/config.json                                      # management_key
 $DATA_DIR/apps/<appId>/app.json
 $DATA_DIR/apps/<appId>/<icon file>
 $DATA_DIR/apps/<appId>/versions/<versionName>/version.json
@@ -116,6 +120,34 @@ single-file fields or with an `artifacts` array:
   that are no longer referenced are left on disk unless the artifact was explicitly replaced or
   deleted through the API.
 
+## Management key
+
+The write API is protected by a single operator secret stored in the mounted volume:
+
+```json
+{
+  "management_key": "0123456789abcdef...64 hex chars"
+}
+```
+
+- Path: `$DATA_DIR/config.json` (`/data/config.json` in the container), next to `apps/`.
+- Created automatically on startup when missing, with a generated 256-bit random key (64 lowercase
+  hex characters) and mode `0600`. An existing file is never overwritten.
+- The key is **not** logged. Read it with `docker compose exec server cat /data/config.json` (the
+  file is owned by the container's `node` user); on Linux with a mismatched host uid use
+  `sudo cat data/config.json`.
+- The file is read fresh on every mutating request. Editing or rotating `management_key` in the
+  mounted volume applies immediately; no restart is needed.
+- Read routes (catalog, icon, download, and the two admin version GETs) stay public. Mutating routes
+  require `X-Management-Key: <management_key>`.
+- Missing, unreadable, symlinked, malformed, or blank config → 503 `management_key_not_configured`
+  for writes. Missing/wrong header → 401 `invalid_management_key`. Reads keep working.
+- The key is compared timing-safely. It travels in a header over plain HTTP by default; use a
+  trusted network or TLS. A reverse proxy must forward `X-Management-Key`.
+- If the volume is read-only the config cannot be created; the server still starts and writes fail
+  closed until the file exists.
+- Edit the file atomically (write a temp file and rename) to avoid a transient 503 during the edit.
+
 ## API
 
 All responses are JSON except the APK download and icon. Errors use
@@ -146,8 +178,9 @@ tie-break.
 
 ## Write API
 
-These routes mutate the volume. There is no authentication or authorization; see the warning at the
-top.
+These routes mutate the volume. Every `POST`, `PUT`, and `DELETE` requires
+`X-Management-Key: <management_key>` from `$DATA_DIR/config.json`; the two `GET` routes below stay
+public. See [Management key](#management-key).
 
 | Method | Path | Notes |
 |---|---|---|
@@ -208,20 +241,27 @@ and `downloadPath` are `null`.
 ### Uploading an APK
 
 ```bash
+KEY=$(docker compose exec -T server node -p 'require("/data/config.json").management_key')
+# Local run instead: KEY=$(node -p 'require("./data/config.json").management_key')
+
 curl -X POST http://127.0.0.1:8080/api/v1/apps \
   -H 'content-type: application/json' \
+  -H "X-Management-Key: $KEY" \
   -d '{"id":"crm","name":"Internal CRM","packageName":"com.company.crm"}'
 
 curl -X POST http://127.0.0.1:8080/api/v1/apps/crm/versions \
   -H 'content-type: application/json' \
+  -H "X-Management-Key: $KEY" \
   -d '{"versionName":"1.4.2","versionCode":142,"minSdk":26}'
 
 curl -X PUT http://127.0.0.1:8080/api/v1/apps/crm/versions/1.4.2/artifacts/arm64-v8a \
   -H 'content-type: application/vnd.android.package-archive' \
+  -H "X-Management-Key: $KEY" \
   --data-binary @app-arm64-v8a.apk
 
 curl -X PUT http://127.0.0.1:8080/api/v1/apps/crm/icon \
   -H 'content-type: image/png' \
+  -H "X-Management-Key: $KEY" \
   --data-binary @icon.png
 ```
 
@@ -241,10 +281,12 @@ curl -X PUT http://127.0.0.1:8080/api/v1/apps/crm/icon \
 | Status | Codes |
 |---|---|
 | 400 | `invalid_request` (bad id, ABI, body, JSON, or content length) |
+| 401 | `invalid_management_key` (missing or wrong `X-Management-Key`) |
 | 404 | `app_not_found`, `version_not_found`, `artifact_not_found`, `icon_not_found` |
 | 409 | `app_exists`, `version_exists`, `app_invalid` (existing `app.json` is unreadable) |
 | 413 | `payload_too_large` (APK or icon limit, or JSON body over 1 MiB) |
 | 415 | `unsupported_media_type` |
+| 503 | `management_key_not_configured` (config.json missing, invalid, or blank) |
 
 ## Docker
 
@@ -254,8 +296,10 @@ docker run --rm -p 8080:8080 -v "$PWD/../data:/data" my-testflight-server:local
 ```
 
 The image runs as `node` (via `su-exec`), creates `/data/apps`, and best-effort chowns the volume
-only when ownership differs. Startup never fails because `mkdir`/`chown` was rejected. The write API
-requires the mounted volume to be writable by that user.
+only when ownership differs. Startup never fails because `mkdir`/`chown` was rejected. On first start
+the server creates `/data/config.json` with a generated key; read it with
+`docker compose exec server cat /data/config.json`. The write API requires the mounted volume to be
+writable by that user.
 
 ## CI
 
@@ -273,3 +317,6 @@ published only from the default branch.
 | `DATA_DIR` | `./data` | Volume root |
 | `LOG_LEVEL` | `info` | Pino level |
 | `MAX_APK_BYTES` | `536870912` | Maximum size of one APK upload |
+
+`$DATA_DIR/config.json` is file-based configuration (`management_key`), not an environment variable.
+It is created on first start and read fresh on every write request.

@@ -154,8 +154,12 @@ export async function readJsonObject(file: string): Promise<Record<string, unkno
   return value;
 }
 
-export async function writeJsonExclusive(file: string, value: unknown): Promise<void> {
-  await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx" });
+export async function writeJsonExclusive(
+  file: string,
+  value: unknown,
+  mode?: number,
+): Promise<void> {
+  await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx", mode });
 }
 
 /**

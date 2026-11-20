@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import type { FastifyInstance } from "fastify";
-import { createHarness, writeAppJson, writeVersion } from "./harness";
+import { authedInject, createHarness, writeAppJson, writeVersion } from "./harness";
 
 const APK = "application/vnd.android.package-archive";
 const OCTET = "application/octet-stream";
@@ -17,7 +17,7 @@ function injectJson(
   url: string,
   payload: unknown,
 ) {
-  return app.inject({
+  return authedInject(app, {
     method,
     url,
     payload: JSON.stringify(payload),
@@ -56,11 +56,11 @@ test("creates, updates, and deletes an app", async (t) => {
   assert.equal(updated.json().app.description, "Updated");
   assert.equal(updated.json().app.name, "Demo");
 
-  const deleted = await harness.app.inject({ method: "DELETE", url: "/api/v1/apps/demo" });
+  const deleted = await authedInject(harness.app, { method: "DELETE", url: "/api/v1/apps/demo" });
   assert.equal(deleted.statusCode, 204);
   assert.equal((await harness.app.inject("/api/v1/apps/demo")).statusCode, 404);
   assert.equal(
-    (await harness.app.inject({ method: "DELETE", url: "/api/v1/apps/demo" })).statusCode,
+    (await authedInject(harness.app, { method: "DELETE", url: "/api/v1/apps/demo" })).statusCode,
     404,
   );
 });
@@ -84,7 +84,7 @@ test("rejects duplicate apps and invalid app payloads", async (t) => {
 
   const empty = await injectJson(harness.app, "PUT", "/api/v1/apps/demo", {});
   assert.equal(empty.statusCode, 400);
-  const nonObject = await harness.app.inject({
+  const nonObject = await authedInject(harness.app, {
     method: "POST",
     url: "/api/v1/apps",
     payload: "[]",
@@ -189,7 +189,7 @@ test("updates version metadata and keeps artifacts", async (t) => {
     versionName: "1.0.0",
     versionCode: 1,
   });
-  const upload = await harness.app.inject({
+  const upload = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/arm64-v8a",
     payload: Buffer.from("arm64"),
@@ -235,7 +235,7 @@ test("uploads an APK with a computed sha256 and serves it", async (t) => {
   });
 
   const bytes = Buffer.from("apk-payload-arm64");
-  const response = await harness.app.inject({
+  const response = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/arm64-v8a",
     payload: bytes,
@@ -287,7 +287,7 @@ test("replaces an ABI upload and keeps the other ABIs", async (t) => {
   });
 
   const first = Buffer.from("arm64-v1");
-  const firstResponse = await harness.app.inject({
+  const firstResponse = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/arm64-v8a",
     payload: first,
@@ -297,7 +297,7 @@ test("replaces an ABI upload and keeps the other ABIs", async (t) => {
   const oldFilename = firstResponse.json().version.artifacts[0].filename;
 
   const second = Buffer.from("arm64-v2-longer");
-  const replaced = await harness.app.inject({
+  const replaced = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/arm64-v8a",
     payload: second,
@@ -312,7 +312,7 @@ test("replaces an ABI upload and keeps the other ABIs", async (t) => {
   );
 
   const x86 = Buffer.from("x86-payload");
-  const added = await harness.app.inject({
+  const added = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/x86_64",
     payload: x86,
@@ -336,7 +336,7 @@ test("rejects invalid uploads", async (t) => {
     versionCode: 1,
   });
 
-  const unknownAbi = await harness.app.inject({
+  const unknownAbi = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/armv7",
     payload: Buffer.from("x"),
@@ -345,7 +345,7 @@ test("rejects invalid uploads", async (t) => {
   assert.equal(unknownAbi.statusCode, 400);
   assert.equal(unknownAbi.json().error.code, "invalid_request");
 
-  const wrongType = await harness.app.inject({
+  const wrongType = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/arm64-v8a",
     payload: Buffer.from("x"),
@@ -354,7 +354,7 @@ test("rejects invalid uploads", async (t) => {
   assert.equal(wrongType.statusCode, 415);
   assert.equal(wrongType.json().error.code, "unsupported_media_type");
 
-  const empty = await harness.app.inject({
+  const empty = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/arm64-v8a",
     payload: Buffer.alloc(0),
@@ -362,7 +362,7 @@ test("rejects invalid uploads", async (t) => {
   });
   assert.equal(empty.statusCode, 400);
 
-  const unknownVersion = await harness.app.inject({
+  const unknownVersion = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/9.9.9/artifacts/arm64-v8a",
     payload: Buffer.from("x"),
@@ -371,7 +371,7 @@ test("rejects invalid uploads", async (t) => {
   assert.equal(unknownVersion.statusCode, 404);
   assert.equal(unknownVersion.json().error.code, "version_not_found");
 
-  const unknownApp = await harness.app.inject({
+  const unknownApp = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/missing/versions/1.0.0/artifacts/arm64-v8a",
     payload: Buffer.from("x"),
@@ -389,7 +389,7 @@ test("enforces MAX_APK_BYTES and cleans the upload temp directory", async (t) =>
     versionCode: 1,
   });
 
-  const tooBig = await harness.app.inject({
+  const tooBig = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/arm64-v8a",
     payload: Buffer.alloc(9, 1),
@@ -400,7 +400,7 @@ test("enforces MAX_APK_BYTES and cleans the upload temp directory", async (t) =>
   const uploads = await fs.readdir(path.join(harness.dataDir, ".uploads")).catch(() => []);
   assert.deepEqual(uploads, []);
 
-  const ok = await harness.app.inject({
+  const ok = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/arm64-v8a",
     payload: Buffer.alloc(8, 1),
@@ -427,7 +427,7 @@ test("migrates a legacy file manifest and preserves the universal artifact", asy
     "app.apk",
   );
 
-  const uploaded = await harness.app.inject({
+  const uploaded = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/arm64-v8a",
     payload: Buffer.from("arm64"),
@@ -457,14 +457,14 @@ test("deletes artifacts and hides the version after the last one", async (t) => 
     versionCode: 1,
   });
 
-  const arm64 = await harness.app.inject({
+  const arm64 = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/arm64-v8a",
     payload: Buffer.from("arm64"),
     headers: { "content-type": APK },
   });
   const filename = arm64.json().version.artifacts[0].filename;
-  const universal = await harness.app.inject({
+  const universal = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/universal",
     payload: Buffer.from("universal"),
@@ -472,7 +472,7 @@ test("deletes artifacts and hides the version after the last one", async (t) => 
   });
   assert.equal(universal.statusCode, 201);
 
-  const deleted = await harness.app.inject({
+  const deleted = await authedInject(harness.app, {
     method: "DELETE",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/arm64-v8a",
   });
@@ -484,7 +484,7 @@ test("deletes artifacts and hides the version after the last one", async (t) => 
     .version;
   assert.deepEqual(afterFirst.abis, ["universal"]);
 
-  const last = await harness.app.inject({
+  const last = await authedInject(harness.app, {
     method: "DELETE",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/universal",
   });
@@ -497,7 +497,7 @@ test("deletes artifacts and hides the version after the last one", async (t) => 
     0,
   );
 
-  const missing = await harness.app.inject({
+  const missing = await authedInject(harness.app, {
     method: "DELETE",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/universal",
   });
@@ -513,7 +513,7 @@ test("deletes versions and apps recursively", async (t) => {
     versionCode: 1,
   });
 
-  const deletedVersion = await harness.app.inject({
+  const deletedVersion = await authedInject(harness.app, {
     method: "DELETE",
     url: "/api/v1/apps/demo/versions/1.0.0",
   });
@@ -527,7 +527,7 @@ test("deletes versions and apps recursively", async (t) => {
     versionName: "2.0.0",
     versionCode: 2,
   });
-  const deletedApp = await harness.app.inject({
+  const deletedApp = await authedInject(harness.app, {
     method: "DELETE",
     url: "/api/v1/apps/demo",
   });
@@ -540,7 +540,7 @@ test("uploads, replaces, and deletes the icon", async (t) => {
   await injectJson(harness.app, "POST", "/api/v1/apps", { id: "demo" });
 
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
-  const putPng = await harness.app.inject({
+  const putPng = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/icon",
     payload: png,
@@ -559,7 +559,7 @@ test("uploads, replaces, and deletes the icon", async (t) => {
   assert.deepEqual(icon.rawPayload, png);
 
   const jpeg = Buffer.from([0xff, 0xd8, 0xff, 1]);
-  const putJpeg = await harness.app.inject({
+  const putJpeg = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/icon",
     payload: jpeg,
@@ -572,7 +572,7 @@ test("uploads, replaces, and deletes the icon", async (t) => {
     jpeg,
   );
 
-  const wrong = await harness.app.inject({
+  const wrong = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/icon",
     payload: Buffer.from("x"),
@@ -581,12 +581,12 @@ test("uploads, replaces, and deletes the icon", async (t) => {
   assert.equal(wrong.statusCode, 415);
 
   assert.equal(
-    (await harness.app.inject({ method: "DELETE", url: "/api/v1/apps/demo/icon" }))
+    (await authedInject(harness.app, { method: "DELETE", url: "/api/v1/apps/demo/icon" }))
       .statusCode,
     204,
   );
   assert.equal((await harness.app.inject("/api/v1/apps/demo/icon")).statusCode, 404);
-  const again = await harness.app.inject({
+  const again = await authedInject(harness.app, {
     method: "DELETE",
     url: "/api/v1/apps/demo/icon",
   });
@@ -598,7 +598,7 @@ test("rejects oversized icons", async (t) => {
   const harness = await createHarness(t);
   await injectJson(harness.app, "POST", "/api/v1/apps", { id: "demo" });
 
-  const response = await harness.app.inject({
+  const response = await authedInject(harness.app, {
     method: "PUT",
     url: "/api/v1/apps/demo/icon",
     payload: Buffer.alloc(2 * 1024 * 1024 + 1, 1),
@@ -611,7 +611,7 @@ test("rejects oversized icons", async (t) => {
 test("maps malformed and oversized JSON bodies", async (t) => {
   const harness = await createHarness(t);
 
-  const malformed = await harness.app.inject({
+  const malformed = await authedInject(harness.app, {
     method: "POST",
     url: "/api/v1/apps",
     payload: "{not json",
@@ -620,7 +620,7 @@ test("maps malformed and oversized JSON bodies", async (t) => {
   assert.equal(malformed.statusCode, 400);
   assert.equal(malformed.json().error.code, "invalid_request");
 
-  const oversized = await harness.app.inject({
+  const oversized = await authedInject(harness.app, {
     method: "POST",
     url: "/api/v1/apps",
     payload: JSON.stringify({ id: "demo", name: "x".repeat(1024 * 1024) }),
@@ -661,12 +661,12 @@ test("rejects traversal identifiers on write routes", async (t) => {
     "/api/v1/apps/demo/versions/bad%20version",
   ];
   for (const url of urls) {
-    const response = await harness.app.inject({ method: "DELETE", url });
+    const response = await authedInject(harness.app, { method: "DELETE", url });
     assert.equal(response.statusCode, 400, url);
     assert.equal(response.json().error.code, "invalid_request", url);
   }
 
-  const badAbi = await harness.app.inject({
+  const badAbi = await authedInject(harness.app, {
     method: "DELETE",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/armv7",
   });

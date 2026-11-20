@@ -4,6 +4,7 @@ import type { AppsService } from "./apps-service";
 import type { AppsWriter, CreateAppInput, CreateVersionInput, UpdateAppInput, UpdateVersionInput } from "./apps-writer";
 import type { Config } from "./config";
 import { HttpError } from "./http-errors";
+import { MANAGEMENT_KEY_HEADER, requireManagementKey } from "./management-config";
 import { requireValidAbi, requireValidId } from "./params";
 import { ICON_EXTENSIONS, ID_PATTERN, MAX_ICON_BYTES, containedPath, isPlainObject } from "./volume";
 
@@ -11,6 +12,8 @@ const APK_CONTENT_TYPES = new Set([
   "application/vnd.android.package-archive",
   "application/octet-stream",
 ]);
+
+const READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 const MANAGED_VERSION_FIELDS = ["artifacts", "file", "sha256"] as const;
 
@@ -184,6 +187,16 @@ export async function registerAdminRoutes(
   options: AdminRoutesOptions,
 ): Promise<void> {
   const { config, service, writer } = options;
+
+  app.addHook("onRequest", async (request, reply) => {
+    if (READ_METHODS.has(request.method)) return;
+    try {
+      await requireManagementKey(config.dataDir, request.headers[MANAGEMENT_KEY_HEADER]);
+    } catch (error) {
+      reply.header("connection", "close");
+      throw error;
+    }
+  });
 
   app.addContentTypeParser(
     ["application/vnd.android.package-archive", "application/octet-stream"],

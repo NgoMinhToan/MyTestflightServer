@@ -5,6 +5,7 @@ import { AppsService } from "./apps-service";
 import { AppsWriter } from "./apps-writer";
 import type { Config } from "./config";
 import { HttpError, sendError } from "./http-errors";
+import { ensureManagementConfig } from "./management-config";
 import { parseAbiQuery, requireValidId } from "./params";
 
 export interface BuildAppOptions {
@@ -53,6 +54,7 @@ export function buildApp(config: Config, options: BuildAppOptions = {}): Fastify
         "could not create the data directory; continuing",
       );
     }
+    await ensureManagementConfig(config.dataDir, app.log);
   });
 
   app.get("/api/v1/health", async (_request, reply) => {
