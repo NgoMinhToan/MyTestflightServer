@@ -295,6 +295,10 @@ docker build -t my-testflight-server:local .
 docker run --rm -p 8080:8080 -v "$PWD/../data:/data" my-testflight-server:local
 ```
 
+When using the workspace compose file, `docker compose up -d --build` rebuilds the image and
+recreates the container. Plain `docker compose up` (even with `--force-recreate`) reuses the
+existing image, so pass `--build` after changing the server code.
+
 The image runs as `node` (via `su-exec`), creates `/data/apps`, and best-effort chowns the volume
 only when ownership differs. Startup never fails because `mkdir`/`chown` was rejected. On first start
 the server creates `/data/config.json` with a generated key; read it with
