@@ -126,3 +126,55 @@ export async function writeApk(
 ): Promise<void> {
   await fs.writeFile(path.join(versionDir, filename), bytes);
 }
+
+export const APK_CONTENT_TYPE = "application/vnd.android.package-archive";
+
+export interface UploadApkOptions {
+  key?: string;
+  query?: Record<string, string>;
+}
+
+/**
+ * Uploads a real APK fixture. `abi` selects the `:abi` route; pass `null` for
+ * the auto-ABI route (`PUT .../artifacts`).
+ */
+export function uploadApk(
+  app: FastifyInstance,
+  appId: string,
+  versionName: string,
+  abi: string | null,
+  bytes: Buffer,
+  options: UploadApkOptions = {},
+) {
+  const pathPart = abi === null ? "artifacts" : `artifacts/${abi}`;
+  const query = options.query ? `?${new URLSearchParams(options.query)}` : "";
+  return authedInject(
+    app,
+    {
+      method: "PUT",
+      url: `/api/v1/apps/${appId}/versions/${versionName}/${pathPart}${query}`,
+      payload: bytes,
+      headers: { "content-type": APK_CONTENT_TYPE },
+    },
+    options.key ?? TEST_MANAGEMENT_KEY,
+  );
+}
+
+export function importApk(
+  app: FastifyInstance,
+  bytes: Buffer,
+  query: Record<string, string> = {},
+  key: string = TEST_MANAGEMENT_KEY,
+) {
+  const search = new URLSearchParams(query).toString();
+  return authedInject(
+    app,
+    {
+      method: "POST",
+      url: `/api/v1/import${search ? `?${search}` : ""}`,
+      payload: bytes,
+      headers: { "content-type": APK_CONTENT_TYPE },
+    },
+    key,
+  );
+}

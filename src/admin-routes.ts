@@ -4,8 +4,17 @@ import type { AppsService } from "./apps-service";
 import type { AppsWriter, CreateAppInput, CreateVersionInput, UpdateAppInput, UpdateVersionInput } from "./apps-writer";
 import type { Config } from "./config";
 import { HttpError } from "./http-errors";
+import { ApkInspectionError } from "./apk-inspect";
 import { MANAGEMENT_KEY_HEADER, requireManagementKey } from "./management-config";
-import { requireValidAbi, requireValidId } from "./params";
+import {
+  parseAllowMismatchQuery,
+  parseCreateQuery,
+  parseOptionalQueryText,
+  parsePositiveIntQuery,
+  parsePublishedAtQuery,
+  requireValidAbi,
+  requireValidId,
+} from "./params";
 import { ICON_EXTENSIONS, ID_PATTERN, MAX_ICON_BYTES, containedPath, isPlainObject } from "./volume";
 
 const APK_CONTENT_TYPES = new Set([
@@ -26,6 +35,34 @@ export interface AdminRoutesOptions {
 function mediaType(request: FastifyRequest): string {
   const header = request.headers["content-type"];
   return typeof header === "string" ? (header.split(";")[0] ?? "").trim().toLowerCase() : "";
+}
+
+/**
+ * Shared APK body reader: validates the content type and returns the raw
+ * stream. The caller must `request.raw.resume()` on every failure path.
+ */
+function readApkBody(request: FastifyRequest): {
+  body: Readable;
+  contentLength: number | undefined;
+} {
+  const type = mediaType(request);
+  if (!APK_CONTENT_TYPES.has(type)) {
+    throw new HttpError(415, "unsupported_media_type", `Unsupported content type "${type}"`);
+  }
+  const body = request.body;
+  if (!(body instanceof Readable)) {
+    throw new HttpError(400, "invalid_request", "Missing APK body");
+  }
+  const declared = Number(request.headers["content-length"]);
+  return { body, contentLength: Number.isFinite(declared) ? declared : undefined };
+}
+
+/** Maps the inspector's internal codes onto the public `invalid_apk` error. */
+function mapApkError(error: unknown): unknown {
+  if (error instanceof ApkInspectionError) {
+    return new HttpError(400, "invalid_apk", error.message);
+  }
+  return error;
 }
 
 function bodyObject(value: unknown): Record<string, unknown> {
@@ -377,40 +414,119 @@ export async function registerAdminRoutes(
     },
   );
 
-  app.put<{ Params: { appId: string; versionName: string; abi: string } }>(
+  app.put<{
+    Params: { appId: string; versionName: string };
+    Querystring: { allow_mismatch?: unknown };
+  }>(
+    "/api/v1/apps/:appId/versions/:versionName/artifacts",
+    async (request, reply) => {
+      try {
+        const appId = requireValidId(request.params.appId, "app id");
+        const versionName = requireValidId(request.params.versionName, "version name");
+        const allowMismatch = parseAllowMismatchQuery(request.query.allow_mismatch);
+        const { body, contentLength } = readApkBody(request);
+        const result = await writer.putArtifact(
+          appId,
+          versionName,
+          body,
+          contentLength,
+          { abi: null, allowMismatch },
+        );
+        const version = await service.getVersionAdmin(appId, versionName);
+        if (!version) {
+          throw new HttpError(500, "internal_error", "Version disappeared after upload");
+        }
+        return reply
+          .code(result.created ? 201 : 200)
+          .send({ version, detected: result.detected });
+      } catch (error) {
+        request.raw.resume();
+        throw mapApkError(error);
+      }
+    },
+  );
+
+  app.put<{
+    Params: { appId: string; versionName: string; abi: string };
+    Querystring: { allow_mismatch?: unknown };
+  }>(
     "/api/v1/apps/:appId/versions/:versionName/artifacts/:abi",
     async (request, reply) => {
       try {
         const appId = requireValidId(request.params.appId, "app id");
         const versionName = requireValidId(request.params.versionName, "version name");
         const abi = requireValidAbi(request.params.abi);
-        const type = mediaType(request);
-        if (!APK_CONTENT_TYPES.has(type)) {
-          throw new HttpError(415, "unsupported_media_type", `Unsupported content type "${type}"`);
-        }
-        const body = request.body;
-        if (!(body instanceof Readable)) {
-          throw new HttpError(400, "invalid_request", "Missing APK body");
-        }
-        const declared = Number(request.headers["content-length"]);
+        const allowMismatch = parseAllowMismatchQuery(request.query.allow_mismatch);
+        const { body, contentLength } = readApkBody(request);
         const result = await writer.putArtifact(
           appId,
           versionName,
-          abi,
           body,
-          Number.isFinite(declared) ? declared : undefined,
+          contentLength,
+          { abi, allowMismatch },
         );
         const version = await service.getVersionAdmin(appId, versionName);
         if (!version) {
           throw new HttpError(500, "internal_error", "Version disappeared after upload");
         }
-        return reply.code(result.created ? 201 : 200).send({ version });
+        return reply
+          .code(result.created ? 201 : 200)
+          .send({ version, detected: result.detected });
       } catch (error) {
         request.raw.resume();
-        throw error;
+        throw mapApkError(error);
       }
     },
   );
+
+  app.post<{
+    Querystring: {
+      create?: unknown;
+      appId?: unknown;
+      version?: unknown;
+      versionCode?: unknown;
+      name?: unknown;
+      releaseNotes?: unknown;
+      publishedAt?: unknown;
+      allow_mismatch?: unknown;
+    };
+  }>("/api/v1/import", async (request, reply) => {
+    try {
+      const query = request.query;
+      const create = parseCreateQuery(query.create);
+      const appIdValue = parseOptionalQueryText(query.appId, "appId");
+      const appId =
+        appIdValue === undefined ? undefined : requireValidId(appIdValue, "app id");
+      const versionValue = parseOptionalQueryText(query.version, "version");
+      const version =
+        versionValue === undefined
+          ? undefined
+          : requireValidId(versionValue, "version name");
+      const versionCode = parsePositiveIntQuery(query.versionCode, "versionCode");
+      const name = parseOptionalQueryText(query.name, "name");
+      const releaseNotes = parseOptionalQueryText(query.releaseNotes, "releaseNotes");
+      const publishedAt = parsePublishedAtQuery(query.publishedAt);
+      const allowMismatch = parseAllowMismatchQuery(query.allow_mismatch);
+      const { body, contentLength } = readApkBody(request);
+
+      const outcome = await writer.importApk(body, contentLength, {
+        create,
+        appId,
+        version,
+        versionCode,
+        name,
+        releaseNotes,
+        publishedAt,
+        allowMismatch,
+      });
+      return reply
+        .code(outcome.created ? 201 : 200)
+        .send(outcome.result);
+    } catch (error) {
+      request.raw.resume();
+      throw mapApkError(error);
+    }
+  });
 
   app.delete<{ Params: { appId: string; versionName: string; abi: string } }>(
     "/api/v1/apps/:appId/versions/:versionName/artifacts/:abi",

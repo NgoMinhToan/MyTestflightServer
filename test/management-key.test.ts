@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import type { FastifyInstance } from "fastify";
 import { TEST_MANAGEMENT_KEY, authedInject, createHarness } from "./harness";
+import { makeApk } from "./apk-fixtures";
 
 const APK = "application/vnd.android.package-archive";
 const PNG = "image/png";
@@ -68,8 +69,15 @@ test("reads stay public without a management key", async (t) => {
   assert.equal((await createApp(harness.app, "demo")).statusCode, 201);
   assert.equal((await createVersion(harness.app, "demo")).statusCode, 201);
   assert.equal(
-    (await uploadApk(harness.app, "demo", "1.0.0", "arm64-v8a", Buffer.from("apk")))
-      .statusCode,
+    (
+      await uploadApk(
+        harness.app,
+        "demo",
+        "1.0.0",
+        "arm64-v8a",
+        makeApk({ abis: ["arm64-v8a"] }),
+      )
+    ).statusCode,
     201,
   );
   assert.equal(
@@ -125,12 +133,22 @@ test("requires a valid management key for writes", async (t) => {
   const upload = {
     method: "PUT",
     url: "/api/v1/apps/demo/versions/1.0.0/artifacts/arm64-v8a",
-    payload: Buffer.from("apk"),
+    payload: makeApk({ abis: ["arm64-v8a"] }),
     headers: { "content-type": APK },
   };
   assert.equal((await harness.app.inject(upload)).statusCode, 401);
   assert.equal((await authedInject(harness.app, upload, "wrong-key")).statusCode, 401);
   assert.equal((await authedInject(harness.app, upload)).statusCode, 201);
+
+  const importBody = {
+    method: "POST",
+    url: "/api/v1/import?create=true&appId=keyapp&version=1.0.0",
+    payload: makeApk({ abis: ["arm64-v8a"] }),
+    headers: { "content-type": APK },
+  };
+  assert.equal((await harness.app.inject(importBody)).statusCode, 401);
+  assert.equal((await authedInject(harness.app, importBody, "wrong-key")).statusCode, 401);
+  assert.equal((await authedInject(harness.app, importBody)).statusCode, 201);
 
   const icon = {
     method: "PUT",
