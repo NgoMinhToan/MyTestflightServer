@@ -143,7 +143,7 @@ test("requires a valid management key for writes", async (t) => {
   const importBody = {
     method: "POST",
     url: "/api/v1/import?create=true&appId=keyapp&version=1.0.0",
-    payload: makeApk({ abis: ["arm64-v8a"] }),
+    payload: makeApk({ packageName: "com.keyapp", abis: ["arm64-v8a"] }),
     headers: { "content-type": APK },
   };
   assert.equal((await harness.app.inject(importBody)).statusCode, 401);

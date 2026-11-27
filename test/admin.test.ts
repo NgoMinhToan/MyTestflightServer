@@ -56,8 +56,10 @@ test("creates, updates, and deletes an app", async (t) => {
   assert.equal(created.statusCode, 201);
   assert.equal(created.headers.location, "/api/v1/apps/demo");
   assert.equal(created.json().app.id, "demo");
+  assert.equal(created.json().app.packageBound, true);
   const manifest = await readJson(path.join(harness.appsDir, "demo", "app.json"));
   assert.equal(manifest.name, "Demo");
+  assert.equal(manifest.packageBound, true);
   assert.ok((await fs.stat(path.join(harness.appsDir, "demo", "versions"))).isDirectory());
 
   const updated = await injectJson(harness.app, "PUT", "/api/v1/apps/demo", {
@@ -172,17 +174,18 @@ test("validates version metadata", async (t) => {
   const harness = await createHarness(t);
   await injectJson(harness.app, "POST", "/api/v1/apps", { id: "demo" });
 
-  const payloads = [
-    {},
-    { versionName: "1.0.0" },
-    { versionName: "1.0.0", versionCode: 0 },
-    { versionName: "1.0.0", versionCode: 1.5 },
-    { versionName: "1.0.0", versionCode: "1" },
-    { versionName: "bad name", versionCode: 1 },
-    { versionName: "1.0.0", versionCode: 1, artifacts: [] },
-    { versionName: "1.0.0", versionCode: 1, file: "app.apk" },
+  const payloads: Array<[Record<string, unknown>, string]> = [
+    [{}, "version_name_invalid"],
+    [{ versionName: "1.0.0" }, "invalid_request"],
+    [{ versionName: "1.0.0", versionCode: 0 }, "invalid_request"],
+    [{ versionName: "1.0.0", versionCode: 1.5 }, "invalid_request"],
+    [{ versionName: "1.0.0", versionCode: "1" }, "invalid_request"],
+    [{ versionName: "bad/name", versionCode: 1 }, "version_name_invalid"],
+    [{ versionName: "bad\\name", versionCode: 1 }, "version_name_invalid"],
+    [{ versionName: "1.0.0", versionCode: 1, artifacts: [] }, "invalid_request"],
+    [{ versionName: "1.0.0", versionCode: 1, file: "app.apk" }, "invalid_request"],
   ];
-  for (const payload of payloads) {
+  for (const [payload, expectedCode] of payloads) {
     const response = await injectJson(
       harness.app,
       "POST",
@@ -190,8 +193,15 @@ test("validates version metadata", async (t) => {
       payload,
     );
     assert.equal(response.statusCode, 400, JSON.stringify(payload));
-    assert.equal(response.json().error.code, "invalid_request");
+    assert.equal(response.json().error.code, expectedCode, JSON.stringify(payload));
   }
+
+  const flexible = await injectJson(harness.app, "POST", "/api/v1/apps/demo/versions", {
+    versionName: "0.2.0 (beta)+1",
+    versionCode: 2,
+  });
+  assert.equal(flexible.statusCode, 201);
+  assert.equal(flexible.json().version.versionName, "0.2.0 (beta)+1");
 });
 
 test("updates version metadata and keeps artifacts", async (t) => {
@@ -682,16 +692,26 @@ test("resolves versions by manifest versionName and refuses duplicates", async (
 
 test("rejects traversal identifiers on write routes", async (t) => {
   const harness = await createHarness(t);
-  const urls = [
-    "/api/v1/apps/%2E%2E%2Fx",
-    "/api/v1/apps/bad%20id",
-    "/api/v1/apps/demo/versions/bad%20version",
-  ];
-  for (const url of urls) {
+  const appUrls = ["/api/v1/apps/%2E%2E%2Fx", "/api/v1/apps/bad%20id"];
+  for (const url of appUrls) {
     const response = await authedInject(harness.app, { method: "DELETE", url });
     assert.equal(response.statusCode, 400, url);
     assert.equal(response.json().error.code, "invalid_request", url);
   }
+
+  const badVersion = await authedInject(harness.app, {
+    method: "DELETE",
+    url: "/api/v1/apps/demo/versions/bad%2Fversion",
+  });
+  assert.equal(badVersion.statusCode, 400);
+  assert.equal(badVersion.json().error.code, "version_name_invalid");
+
+  const spaces = await authedInject(harness.app, {
+    method: "DELETE",
+    url: "/api/v1/apps/demo/versions/bad%20version",
+  });
+  assert.equal(spaces.statusCode, 404, "spaces are a valid flexible version name");
+  assert.equal(spaces.json().error.code, "version_not_found");
 
   const badAbi = await authedInject(harness.app, {
     method: "DELETE",
@@ -1060,16 +1080,18 @@ test("import applies a versionCode query override only with allow_mismatch", asy
   assert.equal(allowed.json().detected.versionCode, 1);
 });
 
-test("import requires a version when the APK has no versionName", async (t) => {
+test("import falls back to String(versionCode) when versionName is unresolved", async (t) => {
   const harness = await createHarness(t);
   const response = await importApkRequest(
     harness.app,
-    makeApk({ versionNameAsReference: true, abis: ["arm64-v8a"] }),
+    makeApk({ versionNameAsReference: true, versionCode: 7, abis: ["arm64-v8a"] }),
     { create: "true", appId: "noversion" },
   );
-  assert.equal(response.statusCode, 400);
-  assert.equal(response.json().error.code, "invalid_request");
-  assert.equal(await pathExists(path.join(harness.appsDir, "noversion")), false);
+  assert.equal(response.statusCode, 201);
+  assert.equal(response.json().version.versionName, "7");
+  assert.equal(response.json().detected.versionName, null);
+  assert.equal(response.json().detected.versionNameSource, "none");
+  assert.equal(response.json().app.packageName, "com.demo");
 });
 
 test("import applies releaseNotes and publishedAt to an existing version", async (t) => {
@@ -1108,4 +1130,52 @@ test("import applies releaseNotes and publishedAt to an existing version", async
   assert.equal(manifest.releaseNotes, "split notes");
   assert.equal(manifest.publishedAt, publishedAt);
   assert.equal(manifest.artifacts.length, 2);
+});
+
+test("supports flexible version names through encoded routes", async (t) => {
+  const harness = await createHarness(t);
+  await injectJson(harness.app, "POST", "/api/v1/apps", { id: "demo" });
+
+  const versionName = "0.2.0 (beta)+1";
+  const encoded = encodeURIComponent(versionName);
+  const created = await injectJson(harness.app, "POST", "/api/v1/apps/demo/versions", {
+    versionName,
+    versionCode: 2,
+  });
+  assert.equal(created.statusCode, 201);
+
+  const detail = await harness.app.inject(`/api/v1/apps/demo/versions/${encoded}`);
+  assert.equal(detail.statusCode, 200);
+  assert.equal(detail.json().version.versionName, versionName);
+
+  const upload = await uploadApk(
+    harness.app,
+    "demo",
+    encoded,
+    "arm64-v8a",
+    makeApk({
+      packageName: "com.demo",
+      versionName,
+      versionCode: 2,
+      abis: ["arm64-v8a"],
+    }),
+  );
+  assert.equal(upload.statusCode, 201);
+  assert.equal(upload.json().version.versionName, versionName);
+
+  const versionDir = path.join(harness.appsDir, "demo", "versions", versionName);
+  assert.ok((await fs.stat(versionDir)).isDirectory());
+
+  const catalog = (await harness.app.inject("/api/v1/apps/demo")).json().app;
+  assert.equal(catalog.latestVersion.versionName, versionName);
+  assert.equal(
+    catalog.latestVersion.downloadPath,
+    `/api/v1/apps/demo/versions/${versionName}/download`,
+  );
+
+  const download = await harness.app.inject(
+    `/api/v1/apps/demo/versions/${encoded}/download`,
+  );
+  assert.equal(download.statusCode, 200);
+  assert.ok(download.rawPayload.length > 0);
 });

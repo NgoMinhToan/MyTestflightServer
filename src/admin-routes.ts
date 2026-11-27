@@ -14,7 +14,10 @@ import {
   parsePublishedAtQuery,
   requireValidAbi,
   requireValidId,
+  requireValidVersionName,
 } from "./params";
+import { isValidVersionName } from "./version-name";
+import { isValidPackageName } from "./app-id";
 import { ICON_EXTENSIONS, ID_PATTERN, MAX_ICON_BYTES, containedPath, isPlainObject } from "./volume";
 
 const APK_CONTENT_TYPES = new Set([
@@ -136,6 +139,24 @@ function parseIconName(value: unknown): string | undefined {
   return name;
 }
 
+function optionalPackageName(value: unknown): string | undefined {
+  const packageName = optionalNonBlank(value, "packageName");
+  if (packageName === undefined) return undefined;
+  if (!isValidPackageName(packageName)) {
+    throw new HttpError(400, "invalid_request", `Invalid packageName "${packageName}"`);
+  }
+  return packageName;
+}
+
+/** `if_missing` accepts only `1`/`true` or `0`/`false`; absent means false. */
+function parseIfMissingQuery(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (raw === "1" || raw === "true") return true;
+  if (raw === "0" || raw === "false") return false;
+  throw new HttpError(400, "invalid_request", "Invalid if_missing (expected 1 or 0)");
+}
+
 function parseCreateApp(body: Record<string, unknown>): CreateAppInput {
   const id = body.id;
   if (typeof id !== "string" || !ID_PATTERN.test(id)) {
@@ -144,7 +165,7 @@ function parseCreateApp(body: Record<string, unknown>): CreateAppInput {
   return {
     id,
     name: optionalNonBlank(body.name, "name"),
-    packageName: optionalNonBlank(body.packageName, "packageName"),
+    packageName: optionalPackageName(body.packageName),
     description: optionalText(body.description, "description"),
     developer: optionalText(body.developer, "developer"),
     icon: parseIconName(body.icon),
@@ -157,7 +178,7 @@ function parseUpdateApp(body: Record<string, unknown>, appId: string): UpdateApp
   }
   const patch: UpdateAppInput = {
     name: optionalNonBlank(body.name, "name"),
-    packageName: optionalNonBlank(body.packageName, "packageName"),
+    packageName: optionalPackageName(body.packageName),
     description: optionalText(body.description, "description"),
     developer: optionalText(body.developer, "developer"),
     icon: parseIconName(body.icon),
@@ -183,8 +204,8 @@ function rejectManagedVersionFields(body: Record<string, unknown>): void {
 function parseCreateVersion(body: Record<string, unknown>): CreateVersionInput {
   rejectManagedVersionFields(body);
   const versionName = body.versionName;
-  if (typeof versionName !== "string" || !ID_PATTERN.test(versionName)) {
-    throw new HttpError(400, "invalid_request", "Invalid versionName");
+  if (!isValidVersionName(versionName)) {
+    throw new HttpError(400, "version_name_invalid", "Invalid versionName");
   }
   const versionCode = optionalPositiveInt(body.versionCode, "versionCode");
   if (versionCode === undefined) {
@@ -304,11 +325,12 @@ export async function registerAdminRoutes(
     return reply.code(204).send();
   });
 
-  app.put<{ Params: { appId: string } }>(
+  app.put<{ Params: { appId: string }; Querystring: { if_missing?: unknown } }>(
     "/api/v1/apps/:appId/icon",
     async (request, reply) => {
       try {
         const appId = requireValidId(request.params.appId, "app id");
+        const ifMissing = parseIfMissingQuery(request.query.if_missing);
         const type = mediaType(request);
         if (!ICON_EXTENSIONS[type]) {
           throw new HttpError(415, "unsupported_media_type", `Unsupported content type "${type}"`);
@@ -317,8 +339,9 @@ export async function registerAdminRoutes(
         if (!(body instanceof Readable)) {
           throw new HttpError(400, "invalid_request", "Missing icon body");
         }
-        await writer.putIcon(appId, type, body);
-        return { iconPath: `/api/v1/apps/${appId}/icon` };
+        const result = await writer.putIcon(appId, type, body, { ifMissing });
+        const iconPath = `/api/v1/apps/${appId}/icon`;
+        return result.skipped ? { iconPath, skipped: true } : { iconPath };
       } catch (error) {
         request.raw.resume();
         throw error;
@@ -351,7 +374,7 @@ export async function registerAdminRoutes(
     "/api/v1/apps/:appId/versions/:versionName",
     async (request) => {
       const appId = requireValidId(request.params.appId, "app id");
-      const versionName = requireValidId(request.params.versionName, "version name");
+      const versionName = requireValidVersionName(request.params.versionName);
       const versions = await service.listVersionsAdmin(appId);
       if (!versions) {
         throw new HttpError(404, "app_not_found", `Unknown app "${appId}"`);
@@ -389,7 +412,7 @@ export async function registerAdminRoutes(
     "/api/v1/apps/:appId/versions/:versionName",
     async (request) => {
       const appId = requireValidId(request.params.appId, "app id");
-      const versionName = requireValidId(request.params.versionName, "version name");
+      const versionName = requireValidVersionName(request.params.versionName);
       const patch = parseUpdateVersion(bodyObject(request.body), versionName);
       await writer.updateVersion(appId, versionName, patch);
       const version = await service.getVersionAdmin(appId, versionName);
@@ -408,7 +431,7 @@ export async function registerAdminRoutes(
     "/api/v1/apps/:appId/versions/:versionName",
     async (request, reply) => {
       const appId = requireValidId(request.params.appId, "app id");
-      const versionName = requireValidId(request.params.versionName, "version name");
+      const versionName = requireValidVersionName(request.params.versionName);
       await writer.deleteVersion(appId, versionName);
       return reply.code(204).send();
     },
@@ -422,7 +445,7 @@ export async function registerAdminRoutes(
     async (request, reply) => {
       try {
         const appId = requireValidId(request.params.appId, "app id");
-        const versionName = requireValidId(request.params.versionName, "version name");
+        const versionName = requireValidVersionName(request.params.versionName);
         const allowMismatch = parseAllowMismatchQuery(request.query.allow_mismatch);
         const { body, contentLength } = readApkBody(request);
         const result = await writer.putArtifact(
@@ -454,7 +477,7 @@ export async function registerAdminRoutes(
     async (request, reply) => {
       try {
         const appId = requireValidId(request.params.appId, "app id");
-        const versionName = requireValidId(request.params.versionName, "version name");
+        const versionName = requireValidVersionName(request.params.versionName);
         const abi = requireValidAbi(request.params.abi);
         const allowMismatch = parseAllowMismatchQuery(request.query.allow_mismatch);
         const { body, contentLength } = readApkBody(request);
@@ -501,7 +524,7 @@ export async function registerAdminRoutes(
       const version =
         versionValue === undefined
           ? undefined
-          : requireValidId(versionValue, "version name");
+          : requireValidVersionName(versionValue);
       const versionCode = parsePositiveIntQuery(query.versionCode, "versionCode");
       const name = parseOptionalQueryText(query.name, "name");
       const releaseNotes = parseOptionalQueryText(query.releaseNotes, "releaseNotes");
@@ -532,7 +555,7 @@ export async function registerAdminRoutes(
     "/api/v1/apps/:appId/versions/:versionName/artifacts/:abi",
     async (request, reply) => {
       const appId = requireValidId(request.params.appId, "app id");
-      const versionName = requireValidId(request.params.versionName, "version name");
+      const versionName = requireValidVersionName(request.params.versionName);
       const abi = requireValidAbi(request.params.abi);
       await writer.deleteArtifact(appId, versionName, abi);
       return reply.code(204).send();

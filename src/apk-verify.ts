@@ -11,9 +11,12 @@ export const MISMATCH_KINDS: readonly MismatchKind[] = [
 ];
 
 export interface ExpectedApkMetadata {
-  /** App id from the route/volume; used for the placeholder-package rule. */
+  /** App id from the route/volume. */
   appId: string;
-  /** `app.json.packageName`; may be `""` or the app id (both are treated as unset). */
+  /**
+   * Effective package for this upload. On the first upload the caller binds the
+   * APK package here; afterwards it is `app.json.packageName`.
+   */
   packageName: string;
   versionName: string;
   versionCode: number;
@@ -37,11 +40,9 @@ export function verifyApkMetadata(options: VerifyApkMetadataOptions): string[] {
   const allow = new Set<MismatchKind>(options.allow ?? []);
   const mismatches: string[] = [];
 
-  const packageUnset =
-    expected.packageName.length === 0 || expected.packageName === expected.appId;
   if (
     !allow.has("package") &&
-    !packageUnset &&
+    expected.packageName.length > 0 &&
     metadata.packageName !== expected.packageName
   ) {
     mismatches.push(

@@ -1,6 +1,13 @@
 import fs from "node:fs/promises";
 import { inflateRawSync } from "node:zlib";
-import type { ApkAbi, ApkMetadata, DetectedApk } from "./types";
+import type { ApkAbi, ApkMetadata, DetectedApk, VersionNameSource } from "./types";
+import type { ResTable } from "./apk-resources";
+import {
+  parseResTable,
+  resolveIconDescriptor,
+  resolveLabel,
+  resolveVersionName,
+} from "./apk-resources";
 import { compareAbi, normalizeAbi } from "./volume";
 
 /**
@@ -37,8 +44,13 @@ const MAX_CENTRAL_DIRECTORY_BYTES = 64 * 1024 * 1024;
 const MAX_ENTRIES = 200_000;
 const MAX_MANIFEST_COMPRESSED_BYTES = 16 * 1024 * 1024;
 const MAX_MANIFEST_INFLATED_BYTES = 8 * 1024 * 1024;
+const MAX_ARSC_COMPRESSED_BYTES = 32 * 1024 * 1024;
+const MAX_ARSC_INFLATED_BYTES = 64 * 1024 * 1024;
+const MAX_ICON_XML_COMPRESSED_BYTES = 2 * 1024 * 1024;
+const MAX_ICON_XML_INFLATED_BYTES = 4 * 1024 * 1024;
 
 const MANIFEST_ENTRY_NAME = "AndroidManifest.xml";
+const RESOURCES_ENTRY_NAME = "resources.arsc";
 
 const UTF8_STRING_POOL_FLAG = 0x100;
 
@@ -65,10 +77,32 @@ interface ZipEntryHeader {
   localOffset: number;
 }
 
+interface RawManifestFacts {
+  packageName?: string;
+  versionCode?: number;
+  versionName?: string | null;
+  versionNameRef?: number | null;
+  label?: string | null;
+  labelRef?: number | null;
+  iconRef?: number | null;
+  roundIconRef?: number | null;
+  minSdk?: number | null;
+  targetSdk?: number | null;
+  debuggable?: boolean;
+  testOnly?: boolean;
+  split?: string | null;
+  configForSplit?: string | null;
+}
+
 interface ManifestFacts {
   packageName: string;
   versionCode: number;
   versionName: string | null;
+  versionNameRef: number | null;
+  label: string | null;
+  labelRef: number | null;
+  iconRef: number | null;
+  roundIconRef: number | null;
   minSdk: number | null;
   targetSdk: number | null;
   debuggable: boolean;
@@ -78,10 +112,11 @@ interface ManifestFacts {
 }
 
 interface TypedValue {
-  kind: "string" | "int" | "bool" | "null";
+  kind: "string" | "int" | "bool" | "reference" | "null";
   string?: string;
   int?: number;
   bool?: boolean;
+  reference?: number;
 }
 
 function invalid(message: string): ApkInspectionError {
@@ -161,12 +196,116 @@ async function inspectApkSource(source: ByteSource): Promise<ApkMetadata> {
   const manifestBytes = await readManifestBytes(source, manifestEntry);
   const facts = parseAxml(manifestBytes);
   const abis = collectAbis(entries);
+  const resolved = await resolveManifestResources(source, entries, facts);
 
   return {
-    ...facts,
+    packageName: facts.packageName,
+    versionCode: facts.versionCode,
+    versionName: resolved.versionName,
+    versionNameSource: resolved.versionNameSource,
+    label: resolved.label,
+    icon: resolved.icon,
+    minSdk: facts.minSdk,
+    targetSdk: facts.targetSdk,
     abis,
     universal: abis.length !== 1,
+    debuggable: facts.debuggable,
+    testOnly: facts.testOnly,
+    split: facts.split,
+    configSplit: facts.configSplit,
   };
+}
+
+interface ResolvedManifestResources {
+  label: string | null;
+  versionName: string | null;
+  versionNameSource: VersionNameSource;
+  icon: ApkMetadata["icon"];
+}
+
+/**
+ * Best-effort resource resolution. A missing/corrupt `resources.arsc` or icon
+ * XML only makes the corresponding value unavailable; the upload still works.
+ */
+async function resolveManifestResources(
+  source: ByteSource,
+  entries: ZipEntryHeader[],
+  facts: ManifestFacts,
+): Promise<ResolvedManifestResources> {
+  const table = await readResourcesTable(source, entries);
+  const readEntry = (name: string) => readIconXml(source, entries, name);
+
+  let label = facts.label !== null && facts.label.trim().length > 0 ? facts.label : null;
+  if (label === null && table !== null && facts.labelRef !== null) {
+    label = resolveLabel(table, facts.labelRef);
+  }
+
+  let versionName: string | null = null;
+  let versionNameSource: VersionNameSource = "none";
+  if (facts.versionName !== null && facts.versionName.trim().length > 0) {
+    versionName = facts.versionName;
+    versionNameSource = "literal";
+  } else if (table !== null && facts.versionNameRef !== null) {
+    const resolved = resolveVersionName(table, facts.versionNameRef);
+    if (resolved !== null && resolved.trim().length > 0) {
+      versionName = resolved;
+      versionNameSource = "resource";
+    }
+  }
+
+  let icon: ApkMetadata["icon"] = null;
+  if (table !== null) {
+    try {
+      if (facts.iconRef !== null) {
+        icon = await resolveIconDescriptor(table, facts.iconRef, readEntry);
+      }
+      if (icon === null && facts.roundIconRef !== null) {
+        icon = await resolveIconDescriptor(table, facts.roundIconRef, readEntry);
+      }
+    } catch {
+      icon = null;
+    }
+  }
+
+  return { label, versionName, versionNameSource, icon };
+}
+
+async function readResourcesTable(
+  source: ByteSource,
+  entries: ZipEntryHeader[],
+): Promise<ResTable | null> {
+  const entry = entries.find((candidate) => candidate.name === RESOURCES_ENTRY_NAME);
+  if (!entry) return null;
+  try {
+    const bytes = await readEntryBytes(
+      source,
+      entry,
+      MAX_ARSC_COMPRESSED_BYTES,
+      MAX_ARSC_INFLATED_BYTES,
+    );
+    return bytes === null ? null : parseResTable(bytes);
+  } catch {
+    return null;
+  }
+}
+
+async function readIconXml(
+  source: ByteSource,
+  entries: ZipEntryHeader[],
+  name: string,
+): Promise<Buffer | null> {
+  const entry = entries.find((candidate) => candidate.name === name);
+  if (!entry) return null;
+  try {
+    return await readEntryBytes(
+      source,
+      entry,
+      MAX_ICON_XML_COMPRESSED_BYTES,
+      MAX_ICON_XML_INFLATED_BYTES,
+    );
+  } catch {
+    return null;
+  }
 }
 
 async function readEndOfCentralDirectory(
@@ -268,51 +407,101 @@ async function readManifestBytes(
   source: ByteSource,
   entry: ZipEntryHeader,
 ): Promise<Buffer> {
+  const bytes = await readEntryBytes(
+    source,
+    entry,
+    MAX_MANIFEST_COMPRESSED_BYTES,
+    MAX_MANIFEST_INFLATED_BYTES,
+    MANIFEST_ENTRY_NAME,
+  );
+  if (bytes === null) throw invalid("AndroidManifest.xml is too large");
+  return bytes;
+}
+
+async function readEntryBytes(
+  source: ByteSource,
+  entry: ZipEntryHeader,
+  maxCompressed: number,
+  maxInflated: number,
+  label = entry.name,
+): Promise<Buffer | null> {
   if (entry.method !== 0 && entry.method !== 8) {
-    throw invalid(`Unsupported manifest compression method ${entry.method}`);
+    throw invalid(`Unsupported compression method for ${label} (${entry.method})`);
   }
-  if (entry.compressedSize > MAX_MANIFEST_COMPRESSED_BYTES) {
-    throw invalid("AndroidManifest.xml is too large");
-  }
-  if (entry.uncompressedSize > MAX_MANIFEST_INFLATED_BYTES) {
-    throw invalid("AndroidManifest.xml is too large");
+  if (entry.compressedSize > maxCompressed || entry.uncompressedSize > maxInflated) {
+    throw invalid(`${label} is too large`);
   }
 
   const localHeader = await source.read(entry.localOffset, 30);
   if (localHeader.length < 30 || localHeader.readUInt32LE(0) !== LOCAL_SIGNATURE) {
-    throw invalid("AndroidManifest.xml has an invalid local header");
+    throw invalid(`${label} has an invalid local header`);
   }
   const nameLength = localHeader.readUInt16LE(26);
   const extraLength = localHeader.readUInt16LE(28);
   const dataOffset = entry.localOffset + 30 + nameLength + extraLength;
   if (dataOffset + entry.compressedSize > source.size) {
-    throw invalid("AndroidManifest.xml data extends past the end of the file");
+    throw invalid(`${label} data extends past the end of the file`);
   }
 
   const compressed = await source.read(dataOffset, entry.compressedSize);
   if (compressed.length !== entry.compressedSize) {
-    throw invalid("AndroidManifest.xml data is truncated");
+    throw invalid(`${label} data is truncated`);
   }
 
   if (entry.method === 0) {
-    if (compressed.length > MAX_MANIFEST_INFLATED_BYTES) {
-      throw invalid("AndroidManifest.xml is too large");
-    }
+    if (compressed.length > maxInflated) throw invalid(`${label} is too large`);
     return compressed;
   }
 
   let inflated: Buffer;
   try {
-    inflated = inflateRawSync(compressed, {
-      maxOutputLength: MAX_MANIFEST_INFLATED_BYTES,
-    });
+    inflated = inflateRawSync(compressed, { maxOutputLength: maxInflated });
   } catch {
-    throw invalid("AndroidManifest.xml could not be inflated");
+    throw invalid(`${label} could not be inflated`);
   }
-  if (inflated.length > MAX_MANIFEST_INFLATED_BYTES) {
-    throw invalid("AndroidManifest.xml is too large");
-  }
+  if (inflated.length > maxInflated) throw invalid(`${label} is too large`);
   return inflated;
+}
+
+/**
+ * Reads one ZIP entry from an APK using the same capped range reader as
+ * inspection. Returns `null` when the file is not a readable ZIP, the entry is
+ * missing, or its size exceeds the caps. Used for icon and resource extraction.
+ */
+export async function readApkEntryBytes(
+  filePath: string,
+  entryName: string,
+  limits: { maxCompressedBytes: number; maxInflatedBytes: number },
+): Promise<Buffer | null> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const stat = await handle.stat();
+    const source: ByteSource = {
+      size: stat.size,
+      read: async (position, length) => {
+        const buffer = Buffer.alloc(length);
+        const { bytesRead } = await handle.read(buffer, 0, length, position);
+        return bytesRead === length ? buffer : buffer.subarray(0, bytesRead);
+      },
+    };
+    if (source.size < 22) return null;
+    const eocd = await readEndOfCentralDirectory(source);
+    const centralDirectory = await source.read(eocd.offset, eocd.size);
+    if (centralDirectory.length !== eocd.size) return null;
+    const entries = readCentralDirectory(centralDirectory, eocd.entryCount);
+    const entry = entries.find((candidate) => candidate.name === entryName);
+    if (!entry) return null;
+    return await readEntryBytes(
+      source,
+      entry,
+      limits.maxCompressedBytes,
+      limits.maxInflatedBytes,
+    );
+  } catch {
+    return null;
+  } finally {
+    await handle.close();
+  }
 }
 
 function parseAxml(buffer: Buffer): ManifestFacts {
@@ -327,17 +516,7 @@ function parseAxml(buffer: Buffer): ManifestFacts {
   if (headerSize < 8 || end < 8) throw invalid("AndroidManifest.xml header is invalid");
 
   let strings: string[] | null = null;
-  const facts: {
-    packageName?: string;
-    versionCode?: number;
-    versionName?: string | null;
-    minSdk?: number | null;
-    targetSdk?: number | null;
-    debuggable?: boolean;
-    testOnly?: boolean;
-    split?: string | null;
-    configForSplit?: string | null;
-  } = {};
+  const facts: RawManifestFacts = {};
 
   let offset = headerSize;
   while (offset + 8 <= end) {
@@ -376,6 +555,11 @@ function parseAxml(buffer: Buffer): ManifestFacts {
     packageName,
     versionCode: facts.versionCode,
     versionName: facts.versionName ?? null,
+    versionNameRef: facts.versionNameRef ?? null,
+    label: facts.label ?? null,
+    labelRef: facts.labelRef ?? null,
+    iconRef: facts.iconRef ?? null,
+    roundIconRef: facts.roundIconRef ?? null,
     minSdk: facts.minSdk ?? null,
     targetSdk: facts.targetSdk ?? null,
     debuggable: facts.debuggable ?? false,
@@ -474,17 +658,7 @@ function parseStartElement(
   chunkStart: number,
   chunkSize: number,
   strings: string[],
-  facts: {
-    packageName?: string;
-    versionCode?: number;
-    versionName?: string | null;
-    minSdk?: number | null;
-    targetSdk?: number | null;
-    debuggable?: boolean;
-    testOnly?: boolean;
-    split?: string | null;
-    configForSplit?: string | null;
-  },
+  facts: RawManifestFacts,
 ): void {
   // ResXMLTree_node is 16 bytes; the attribute extension starts at +16.
   if (chunkSize < 16 + 20) throw invalid("AndroidManifest.xml element is truncated");
@@ -493,6 +667,7 @@ function parseStartElement(
   const attributeCount = buffer.readUInt16LE(chunkStart + 28);
   if (attributeSize < 20) throw invalid("AndroidManifest.xml attribute size is invalid");
 
+  const elementName = strings[buffer.readUInt32LE(chunkStart + 20)] ?? "";
   const attributesStart = chunkStart + 16 + attributeStart;
   const chunkEnd = chunkStart + chunkSize;
 
@@ -507,7 +682,12 @@ function parseStartElement(
     const name = strings[nameIndex] ?? "";
     const rawValue =
       rawValueIndex === 0xffffffff ? null : (strings[rawValueIndex] ?? null);
-    applyAttribute(facts, name, typedValue(strings, dataType, data, rawValue));
+    applyAttribute(
+      facts,
+      elementName,
+      name,
+      typedValue(strings, dataType, data, rawValue),
+    );
   }
 }
 
@@ -529,7 +709,7 @@ function typedValue(
     case TYPE_INT_BOOLEAN:
       return { kind: "bool", bool: data !== 0 };
     case TYPE_REFERENCE:
-      return { kind: "null" };
+      return { kind: "reference", reference: data >>> 0 };
     default:
       // Unknown typed value: fall back to the raw string when present.
       return rawValue === null
@@ -539,51 +719,78 @@ function typedValue(
 }
 
 function applyAttribute(
-  facts: {
-    packageName?: string;
-    versionCode?: number;
-    versionName?: string | null;
-    minSdk?: number | null;
-    targetSdk?: number | null;
-    debuggable?: boolean;
-    testOnly?: boolean;
-    split?: string | null;
-    configForSplit?: string | null;
-  },
+  facts: RawManifestFacts,
+  element: string,
   name: string,
   value: TypedValue,
 ): void {
   switch (name) {
     case "package":
-      if (value.kind === "string" && value.string!.length > 0) {
+      if (element === "manifest" && value.kind === "string" && value.string!.length > 0) {
         facts.packageName = value.string;
       }
       return;
     case "versionCode":
+      if (element !== "manifest") return;
       if (value.kind !== "int" || value.int! <= 0) {
         throw invalid("AndroidManifest.xml versionCode must be a positive integer literal");
       }
       facts.versionCode = value.int;
       return;
     case "versionName":
-      facts.versionName = value.kind === "string" ? value.string! : null;
+      if (element !== "manifest") return;
+      if (value.kind === "string") {
+        facts.versionName = value.string!;
+        facts.versionNameRef = null;
+      } else if (value.kind === "reference") {
+        facts.versionName = null;
+        facts.versionNameRef = value.reference!;
+      } else {
+        facts.versionName = null;
+      }
+      return;
+    case "label":
+      if (element !== "application") return;
+      if (value.kind === "string") {
+        facts.label = value.string!;
+        facts.labelRef = null;
+      } else if (value.kind === "reference") {
+        facts.label = null;
+        facts.labelRef = value.reference!;
+      }
+      return;
+    case "icon":
+      if (element === "application" && value.kind === "reference") {
+        facts.iconRef = value.reference!;
+      }
+      return;
+    case "roundIcon":
+      if (element === "application" && value.kind === "reference") {
+        facts.roundIconRef = value.reference!;
+      }
       return;
     case "minSdkVersion":
+      if (element !== "uses-sdk") return;
       facts.minSdk = value.kind === "int" ? value.int! : null;
       return;
     case "targetSdkVersion":
+      if (element !== "uses-sdk") return;
       facts.targetSdk = value.kind === "int" ? value.int! : null;
       return;
     case "debuggable":
+      if (element !== "application") return;
       facts.debuggable = value.kind === "bool" ? value.bool! : false;
       return;
     case "testOnly":
+      if (element !== "application") return;
       facts.testOnly = value.kind === "bool" ? value.bool! : false;
       return;
     case "split":
+      if (element !== "manifest") return;
       facts.split = value.kind === "string" ? value.string! : null;
       return;
     case "configForSplit":
+      if (element !== "manifest") return;
       facts.configForSplit = value.kind === "string" ? value.string! : null;
       return;
     default:

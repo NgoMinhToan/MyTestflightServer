@@ -18,6 +18,7 @@ import type {
   VersionRecord,
   VersionSummary,
 } from "./types";
+import { isValidVersionName } from "./version-name";
 import {
   APK_EXTENSION,
   ID_PATTERN,
@@ -192,6 +193,7 @@ export class AppsService {
       id: record.id,
       name: record.name,
       packageName: record.packageName,
+      packageBound: record.packageBound,
       description: record.description,
       developer: record.developer,
       iconPath: record.iconPath ? `/api/v1/apps/${record.id}/icon` : null,
@@ -282,7 +284,9 @@ export class AppsService {
         releaseNotes: entry.releaseNotes,
         publishedAt: entry.publishedAt,
         artifacts: entry.artifacts,
-        defaultArtifact: entry.artifacts[0],
+        defaultArtifact: entry.artifacts[0]!,
+        iconPath: entry.iconPath,
+        iconContentType: entry.iconContentType,
       });
     }
 
@@ -292,11 +296,12 @@ export class AppsService {
         collator.compare(right.versionName, left.versionName),
     );
 
-    const icon = await this.resolveIcon(appDir, manifest.icon);
+    const icon = await this.resolveIcon(appDir, manifest.icon, versions);
     return {
       id,
       name: manifest.name,
       packageName: manifest.packageName,
+      packageBound: manifest.packageBound,
       description: manifest.description,
       developer: manifest.developer,
       iconPath: icon?.path ?? null,
@@ -357,7 +362,7 @@ export class AppsService {
     }
 
     const dirNames = entries
-      .filter((entry) => entry.isDirectory() && ID_PATTERN.test(entry.name))
+      .filter((entry) => entry.isDirectory() && isValidVersionName(entry.name))
       .map((entry) => entry.name)
       .sort((left, right) => left.localeCompare(right));
 
@@ -420,7 +425,7 @@ export class AppsService {
     let versionName = dirName;
     const declaredName = nonBlankString(manifest.versionName);
     if (declaredName !== null) {
-      if (!ID_PATTERN.test(declaredName)) {
+      if (!isValidVersionName(declaredName)) {
         this.logger.warn(
           { versionDir, versionName: declaredName },
           "skipping version with an invalid versionName",
@@ -436,6 +441,7 @@ export class AppsService {
       typeof minSdkValue === "number" && Number.isInteger(minSdkValue) && minSdkValue > 0
         ? minSdkValue
         : null;
+    const icon = await this.resolveVersionIcon(versionDir, manifest.icon);
 
     return {
       dir: versionDir,
@@ -450,7 +456,32 @@ export class AppsService {
         artifacts.length > 0 ? artifacts[0].mtime : json.mtime,
       ),
       artifacts,
+      icon: icon?.filename ?? null,
+      iconPath: icon?.path ?? null,
+      iconContentType: icon?.contentType ?? null,
+      detectedPackageName: nonBlankString(manifest.detectedPackageName),
     };
+  }
+
+  /** Resolves `version.json.icon` to a contained image file, ignoring bad names. */
+  private async resolveVersionIcon(
+    versionDir: string,
+    declared: unknown,
+  ): Promise<{ filename: string; path: string; contentType: string } | null> {
+    const filename = nonBlankString(declared);
+    if (filename === null) return null;
+    const resolved = containedPath(versionDir, filename);
+    if (resolved === null) return null;
+    const contentType = ICON_CONTENT_TYPES[path.extname(resolved).toLowerCase()];
+    if (!contentType) return null;
+    try {
+      const stat = await fs.lstat(resolved);
+      if (!stat.isFile()) return null;
+    } catch (error) {
+      if (isNotFound(error)) return null;
+      throw error;
+    }
+    return { filename, path: resolved, contentType };
   }
 
   /**
@@ -588,21 +619,34 @@ export class AppsService {
     return [{ abi: "universal", ...apk, sha256: resolveSha256(manifest.sha256) }];
   }
 
+  /**
+   * Effective app icon: the app-level file first, then the raster icon of the
+   * newest published version (highest `versionCode`) that has one.
+   */
   private async resolveIcon(
     appDir: string,
     declared: string,
+    versions: readonly VersionRecord[],
   ): Promise<{ path: string; contentType: string } | null> {
     const resolved = containedPath(appDir, declared);
-    if (resolved === null) return null;
-    try {
-      const stat = await fs.lstat(resolved);
-      if (!stat.isFile()) return null;
-    } catch (error) {
-      if (isNotFound(error)) return null;
-      throw error;
+    if (resolved !== null) {
+      try {
+        const stat = await fs.lstat(resolved);
+        if (stat.isFile()) {
+          const contentType =
+            ICON_CONTENT_TYPES[path.extname(resolved).toLowerCase()] ??
+            "application/octet-stream";
+          return { path: resolved, contentType };
+        }
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+      }
     }
-    const contentType =
-      ICON_CONTENT_TYPES[path.extname(resolved).toLowerCase()] ?? "application/octet-stream";
-    return { path: resolved, contentType };
+
+    for (const version of versions) {
+      if (version.iconPath === null || version.iconContentType === null) continue;
+      return { path: version.iconPath, contentType: version.iconContentType };
+    }
+    return null;
   }
 }

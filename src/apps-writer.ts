@@ -9,11 +9,14 @@ import type { Config } from "./config";
 import { HttpError } from "./http-errors";
 import type { AppsService } from "./apps-service";
 import { artifactAbiOf, inspectApkFile, toDetected } from "./apk-inspect";
+import { appIdFromPackage, isValidPackageName } from "./app-id";
+import { extractRasterIcon } from "./apk-icon";
 import {
   formatMismatch,
   verifyApkMetadata,
   type MismatchKind,
 } from "./apk-verify";
+import { isValidVersionName } from "./version-name";
 import type {
   ApkAbi,
   ApkArtifactRecord,
@@ -21,6 +24,7 @@ import type {
   AppManifest,
   DetectedApk,
   ImportResult,
+  VersionEntry,
 } from "./types";
 import {
   DEFAULT_ICON,
@@ -33,6 +37,7 @@ import {
   errorCode,
   humanizeAppId,
   isNotFound,
+  manifestPackageBound,
   nonBlankString,
   readJsonObject,
   resolveAppDir,
@@ -138,11 +143,21 @@ export class AppsWriter {
 
   async createApp(input: CreateAppInput): Promise<void> {
     this.assertId(input.id, "app id");
+    const declaredPackage = input.packageName?.trim() || undefined;
+    if (declaredPackage !== undefined) this.assertPackage(declaredPackage);
+    const packageName = declaredPackage ?? input.id;
+    // An explicit package is authoritative even when it equals the app id.
+    const packageBound = declaredPackage !== undefined;
+
     const appsDir = path.join(this.config.dataDir, "apps");
     await fs.mkdir(appsDir, { recursive: true });
     const appDir = path.join(appsDir, input.id);
 
     await withLock(this.lockKey(input.id), async () => {
+      if (packageBound) {
+        await this.assertPackageUnused(packageName, input.id);
+      }
+
       try {
         await fs.mkdir(appDir);
       } catch (error) {
@@ -157,7 +172,8 @@ export class AppsWriter {
         const manifest: AppManifest = {
           schemaVersion: 1,
           name: input.name ?? humanizeAppId(input.id),
-          packageName: input.packageName ?? input.id,
+          packageName,
+          packageBound,
           description: input.description ?? "",
           developer: input.developer ?? "",
           icon: input.icon ?? DEFAULT_ICON,
@@ -172,16 +188,44 @@ export class AppsWriter {
 
   async updateApp(appId: string, patch: UpdateAppInput): Promise<void> {
     this.assertId(appId, "app id");
+    const nextPackage = patch.packageName?.trim();
+    if (nextPackage !== undefined) this.assertPackage(nextPackage);
 
     await withLock(this.lockKey(appId), async () => {
       const appDir = await this.requireAppDir(appId);
       const raw = await this.readAppObject(appDir, appId);
       const next: Record<string, unknown> = { ...raw };
       if (patch.name !== undefined) next.name = patch.name;
-      if (patch.packageName !== undefined) next.packageName = patch.packageName;
       if (patch.description !== undefined) next.description = patch.description;
       if (patch.developer !== undefined) next.developer = patch.developer;
       if (patch.icon !== undefined) next.icon = patch.icon;
+
+      // Backfill the explicit flag for legacy manifests on any update.
+      if (typeof next.packageBound !== "boolean") {
+        next.packageBound = manifestPackageBound(raw, appId);
+      }
+
+      if (nextPackage !== undefined) {
+        const current = nonBlankString(raw.packageName) ?? appId;
+        const currentBound = manifestPackageBound(raw, appId);
+        const targetBound = nextPackage.length > 0;
+        const targetPackage = targetBound ? nextPackage : appId;
+        if (targetPackage !== current || targetBound !== currentBound) {
+          if (await this.appHasArtifact(appId)) {
+            throw new HttpError(
+              409,
+              "package_locked",
+              `Cannot change packageName for "${appId}" after an APK was uploaded`,
+            );
+          }
+          if (targetBound) {
+            await this.assertPackageUnused(targetPackage, appId);
+          }
+        }
+        next.packageName = targetPackage;
+        next.packageBound = targetBound;
+      }
+
       await writeJsonAtomic(path.join(appDir, "app.json"), next);
     });
   }
@@ -202,7 +246,12 @@ export class AppsWriter {
     });
   }
 
-  async putIcon(appId: string, contentType: string, source: Readable | undefined): Promise<void> {
+  async putIcon(
+    appId: string,
+    contentType: string,
+    source: Readable | undefined,
+    options: { ifMissing?: boolean } = {},
+  ): Promise<{ skipped: boolean }> {
     this.assertId(appId, "app id");
     const extension = ICON_EXTENSIONS[contentType];
     if (!extension) {
@@ -213,9 +262,14 @@ export class AppsWriter {
     const received = await this.receiveToTemp(source, MAX_ICON_BYTES);
     let moved = false;
     try {
-      await withLock(this.lockKey(appId), async () => {
+      return await withLock(this.lockKey(appId), async () => {
         const appDir = await this.requireAppDir(appId);
         const raw = await this.readAppObject(appDir, appId);
+
+        if (options.ifMissing && (await this.findAppIcon(appDir, raw.icon)) !== null) {
+          return { skipped: true };
+        }
+
         const filename = `app_icon.${extension}`;
         await fs.rename(received.tempPath, path.join(appDir, filename));
         moved = true;
@@ -225,6 +279,7 @@ export class AppsWriter {
         if (previous !== null && previous !== filename) {
           await this.unlinkContained(appDir, previous);
         }
+        return { skipped: false };
       });
     } finally {
       if (!moved) {
@@ -240,29 +295,20 @@ export class AppsWriter {
       const appDir = await this.requireAppDir(appId);
       const raw = await this.readAppObject(appDir, appId);
       const declared = nonBlankString(raw.icon) ?? DEFAULT_ICON;
-      const resolved = containedPath(appDir, declared);
+      const resolved = await this.findAppIcon(appDir, declared);
       if (resolved === null) {
         throw new HttpError(404, "icon_not_found", `No icon for app "${appId}"`);
       }
-      let stat;
-      try {
-        stat = await fs.lstat(resolved);
-      } catch (error) {
-        if (isNotFound(error)) {
-          throw new HttpError(404, "icon_not_found", `No icon for app "${appId}"`);
-        }
-        throw error;
-      }
-      if (!stat.isFile()) {
-        throw new HttpError(404, "icon_not_found", `No icon for app "${appId}"`);
-      }
       await fs.unlink(resolved);
+      // Reset to the default name so a later GET falls back to the newest
+      // version icon instead of pointing at a deleted file.
+      await writeJsonAtomic(path.join(appDir, "app.json"), { ...raw, icon: DEFAULT_ICON });
     });
   }
 
   async createVersion(appId: string, input: CreateVersionInput): Promise<void> {
     this.assertId(appId, "app id");
-    this.assertId(input.versionName, "version name");
+    this.assertVersionName(input.versionName);
 
     await withLock(this.lockKey(appId), async () => {
       const appDir = await this.requireAppDir(appId);
@@ -309,7 +355,7 @@ export class AppsWriter {
     input: UpdateVersionInput,
   ): Promise<void> {
     this.assertId(appId, "app id");
-    this.assertId(versionName, "version name");
+    this.assertVersionName(versionName);
     if (input.versionName !== undefined && input.versionName !== versionName) {
       throw new HttpError(400, "invalid_request", "versionName cannot be changed");
     }
@@ -346,7 +392,7 @@ export class AppsWriter {
 
   async deleteVersion(appId: string, versionName: string): Promise<void> {
     this.assertId(appId, "app id");
-    this.assertId(versionName, "version name");
+    this.assertVersionName(versionName);
 
     await withLock(this.lockKey(appId), async () => {
       const entry = await this.requireVersion(appId, versionName);
@@ -415,17 +461,27 @@ export class AppsWriter {
     options: StoreApkOptions,
   ): Promise<{ created: boolean }> {
     this.assertId(appId, "app id");
-    this.assertId(versionName, "version name");
+    this.assertVersionName(versionName);
 
     return withLock(this.lockKey(appId), async () => {
       const entry = await this.requireVersion(appId, versionName);
       const appDir = await this.requireAppDir(appId);
       const appManifest = await this.readAppObject(appDir, appId);
+      const declaredPackage = nonBlankString(appManifest.packageName);
+      const bound = manifestPackageBound(appManifest, appId);
+      // Only an explicitly unbound app without a real package binds on upload.
+      const bindPackage =
+        !bound && (declaredPackage === null || declaredPackage === appId);
       const expectedPackageName =
         options.expectedPackageName ??
-        nonBlankString(appManifest.packageName) ??
-        appId;
+        (bindPackage ? received.metadata.packageName : (declaredPackage ?? appId));
       const abi = options.declaredAbi ?? artifactAbiOf(received.metadata);
+
+      if (bindPackage) {
+        // The package may equal the app id while another app already owns it;
+        // always check before binding (the helper skips this app and unbound apps).
+        await this.assertPackageUnused(received.metadata.packageName, appId);
+      }
 
       const mismatches = verifyApkMetadata({
         metadata: received.metadata,
@@ -448,7 +504,8 @@ export class AppsWriter {
       }
 
       const filename = `${abi}-${received.sha256.slice(0, 16)}.apk`;
-      await fs.rename(received.tempPath, path.join(entry.dir, filename));
+      const storedPath = path.join(entry.dir, filename);
+      await fs.rename(received.tempPath, storedPath);
 
       const created = !entry.artifacts.some((artifact) => artifact.abi === abi);
       const artifacts: ArtifactManifestEntry[] = entry.artifacts
@@ -464,12 +521,29 @@ export class AppsWriter {
       const next: Record<string, unknown> = { ...entry.manifest, artifacts };
       delete next.file;
       delete next.sha256;
+      next.detectedPackageName = received.metadata.packageName;
       // Auto-fill a missing minSdk from the APK; never overwrite a declared one.
       if (entry.minSdk === null && received.metadata.minSdk !== null) {
         next.minSdk = received.metadata.minSdk;
       }
+
+      const icon = await this.storeVersionIcon(entry, storedPath, received.metadata);
+      if (icon !== null) next.icon = icon;
+
       await writeJsonAtomic(path.join(entry.dir, "version.json"), next);
       await this.cleanupReplaced(entry.dir, entry.artifacts, artifacts, filename);
+      if (icon !== null && entry.icon !== null && entry.icon !== icon) {
+        await this.unlinkContained(entry.dir, entry.icon);
+      }
+
+      if (bindPackage) {
+        await writeJsonAtomic(path.join(appDir, "app.json"), {
+          ...appManifest,
+          packageName: received.metadata.packageName,
+          packageBound: true,
+        });
+      }
+
       return { created };
     });
   }
@@ -486,7 +560,7 @@ export class AppsWriter {
     options: PutArtifactOptions,
   ): Promise<{ created: boolean; detected: DetectedApk }> {
     this.assertId(appId, "app id");
-    this.assertId(versionName, "version name");
+    this.assertVersionName(versionName);
     if (contentLength !== undefined && contentLength > this.config.maxApkBytes) {
       throw new HttpError(
         413,
@@ -531,31 +605,32 @@ export class AppsWriter {
     const received = await this.receiveApk(source, contentLength);
     try {
       const metadata = received.metadata;
-      const appId = options.appId ?? metadata.packageName;
+      const appId = options.appId ?? appIdFromPackage(metadata.packageName);
       this.assertId(appId, "app id");
 
       const existingApp = await this.reader.getApp(appId);
       if (!existingApp && !options.create) {
         throw new HttpError(404, "app_not_found", `Unknown app "${appId}"`);
       }
-      const appPackageName = existingApp
-        ? existingApp.packageName
-        : metadata.packageName;
+      const existingPackage = existingApp
+        ? nonBlankString(existingApp.packageName)
+        : null;
+      // A bound app (including auto-created id == package) must match before
+      // any version/draft is written; only an unbound app binds here.
+      const appPackageName =
+        existingApp === null || !existingApp.packageBound
+          ? metadata.packageName
+          : (existingPackage ?? appId);
       const appName =
         options.name ??
-        (existingApp
-          ? undefined
-          : humanizeAppId(lastPackageSegment(metadata.packageName)));
+        metadata.label ??
+        humanizeAppId(lastPackageSegment(metadata.packageName));
 
-      const versionName = options.version ?? metadata.versionName;
-      if (versionName === null || versionName === undefined) {
-        throw new HttpError(
-          400,
-          "invalid_request",
-          "Cannot infer versionName from the APK; provide ?version=",
-        );
-      }
-      this.assertId(versionName, "version name");
+      // A resource-referenced versionName that could not be resolved falls back
+      // to the numeric versionCode, matching Play Console's behavior.
+      const versionName =
+        options.version ?? metadata.versionName ?? String(metadata.versionCode);
+      this.assertVersionName(versionName);
 
       const existingVersion =
         existingApp === null
@@ -598,6 +673,19 @@ export class AppsWriter {
           createdApp = true;
         } catch (error) {
           if (!isConflict(error)) throw error;
+          // The app was created concurrently under the same id. Re-read it and
+          // refuse to mutate an app that belongs to a different package.
+          if (error instanceof HttpError && error.code === "package_in_use") throw error;
+          const raced = await this.reader.getApp(appId);
+          if (!raced) throw error;
+          const racedPackage = nonBlankString(raced.packageName) ?? appId;
+          if (raced.packageBound && racedPackage !== metadata.packageName) {
+            throw new HttpError(
+              409,
+              "package_in_use",
+              `App "${appId}" already exists with package "${racedPackage}"`,
+            );
+          }
         }
       }
 
@@ -677,7 +765,7 @@ export class AppsWriter {
 
   async deleteArtifact(appId: string, versionName: string, abi: ApkAbi): Promise<void> {
     this.assertId(appId, "app id");
-    this.assertId(versionName, "version name");
+    this.assertVersionName(versionName);
 
     await withLock(this.lockKey(appId), async () => {
       const entry = await this.requireVersion(appId, versionName);
@@ -810,6 +898,83 @@ export class AppsWriter {
   private assertId(value: string, label: string): void {
     if (!ID_PATTERN.test(value)) {
       throw new HttpError(400, "invalid_request", `Invalid ${label}`);
+    }
+  }
+
+  private assertVersionName(value: string): void {
+    if (!isValidVersionName(value)) {
+      throw new HttpError(
+        400,
+        "version_name_invalid",
+        `Invalid version name "${value}"`,
+      );
+    }
+  }
+
+  private assertPackage(value: string): void {
+    if (!isValidPackageName(value)) {
+      throw new HttpError(400, "invalid_request", `Invalid packageName "${value}"`);
+    }
+  }
+
+  /** Rejects a package already bound to another app (unbound placeholders do not reserve). */
+  private async assertPackageUnused(packageName: string, excludeAppId: string): Promise<void> {
+    const apps = await this.reader.listApps();
+    for (const app of apps) {
+      if (app.id === excludeAppId) continue;
+      if (!app.packageBound) continue;
+      if (app.packageName === packageName) {
+        throw new HttpError(
+          409,
+          "package_in_use",
+          `Package "${packageName}" is already used by app "${app.id}"`,
+        );
+      }
+    }
+  }
+
+  private async appHasArtifact(appId: string): Promise<boolean> {
+    const versions = await this.reader.listVersionsAdmin(appId);
+    return versions?.some((version) => version.artifacts.length > 0) ?? false;
+  }
+
+  private async findAppIcon(appDir: string, declared: unknown): Promise<string | null> {
+    const name = nonBlankString(declared);
+    if (name === null) return null;
+    const resolved = containedPath(appDir, name);
+    if (resolved === null) return null;
+    try {
+      const stat = await fs.lstat(resolved);
+      return stat.isFile() ? resolved : null;
+    } catch (error) {
+      if (isNotFound(error)) return null;
+      throw error;
+    }
+  }
+
+  /**
+   * Best-effort raster icon extraction. A missing/corrupt/adaptive icon never
+   * fails the upload; the previous version icon (if any) is kept.
+   */
+  private async storeVersionIcon(
+    entry: VersionEntry,
+    apkPath: string,
+    metadata: ApkMetadata,
+  ): Promise<string | null> {
+    if (metadata.icon === null || metadata.icon.kind !== "raster") return null;
+    try {
+      const extracted = await extractRasterIcon(apkPath, metadata.icon);
+      if (extracted === null) return null;
+      const target = containedPath(entry.dir, extracted.filename);
+      if (target === null) return null;
+      await fs.writeFile(target, extracted.bytes);
+      return extracted.filename;
+    } catch (error) {
+      this.logger.warn(
+        { err: error, versionDir: entry.dir },
+        "could not extract or store the version icon",
+      );
+      return null;
     }
   }
 
