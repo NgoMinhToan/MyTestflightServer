@@ -56,8 +56,10 @@ test("creates, updates, and deletes an app", async (t) => {
   assert.equal(created.statusCode, 201);
   assert.equal(created.headers.location, "/api/v1/apps/demo");
   assert.equal(created.json().app.id, "demo");
+  assert.equal(created.json().app.packageBound, true);
   const manifest = await readJson(path.join(harness.appsDir, "demo", "app.json"));
   assert.equal(manifest.name, "Demo");
+  assert.equal(manifest.packageBound, true);
   assert.ok((await fs.stat(path.join(harness.appsDir, "demo", "versions"))).isDirectory());
 
   const updated = await injectJson(harness.app, "PUT", "/api/v1/apps/demo", {

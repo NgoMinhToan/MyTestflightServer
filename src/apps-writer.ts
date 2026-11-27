@@ -37,6 +37,7 @@ import {
   errorCode,
   humanizeAppId,
   isNotFound,
+  manifestPackageBound,
   nonBlankString,
   readJsonObject,
   resolveAppDir,
@@ -145,13 +146,15 @@ export class AppsWriter {
     const declaredPackage = input.packageName?.trim() || undefined;
     if (declaredPackage !== undefined) this.assertPackage(declaredPackage);
     const packageName = declaredPackage ?? input.id;
+    // An explicit package is authoritative even when it equals the app id.
+    const packageBound = declaredPackage !== undefined;
 
     const appsDir = path.join(this.config.dataDir, "apps");
     await fs.mkdir(appsDir, { recursive: true });
     const appDir = path.join(appsDir, input.id);
 
     await withLock(this.lockKey(input.id), async () => {
-      if (packageName !== input.id) {
+      if (packageBound) {
         await this.assertPackageUnused(packageName, input.id);
       }
 
@@ -170,6 +173,7 @@ export class AppsWriter {
           schemaVersion: 1,
           name: input.name ?? humanizeAppId(input.id),
           packageName,
+          packageBound,
           description: input.description ?? "",
           developer: input.developer ?? "",
           icon: input.icon ?? DEFAULT_ICON,
@@ -196,9 +200,17 @@ export class AppsWriter {
       if (patch.developer !== undefined) next.developer = patch.developer;
       if (patch.icon !== undefined) next.icon = patch.icon;
 
+      // Backfill the explicit flag for legacy manifests on any update.
+      if (typeof next.packageBound !== "boolean") {
+        next.packageBound = manifestPackageBound(raw, appId);
+      }
+
       if (nextPackage !== undefined) {
         const current = nonBlankString(raw.packageName) ?? appId;
-        if (nextPackage !== current) {
+        const currentBound = manifestPackageBound(raw, appId);
+        const targetBound = nextPackage.length > 0;
+        const targetPackage = targetBound ? nextPackage : appId;
+        if (targetPackage !== current || targetBound !== currentBound) {
           if (await this.appHasArtifact(appId)) {
             throw new HttpError(
               409,
@@ -206,11 +218,12 @@ export class AppsWriter {
               `Cannot change packageName for "${appId}" after an APK was uploaded`,
             );
           }
-          if (nextPackage !== appId) {
-            await this.assertPackageUnused(nextPackage, appId);
+          if (targetBound) {
+            await this.assertPackageUnused(targetPackage, appId);
           }
         }
-        next.packageName = nextPackage;
+        next.packageName = targetPackage;
+        next.packageBound = targetBound;
       }
 
       await writeJsonAtomic(path.join(appDir, "app.json"), next);
@@ -455,17 +468,18 @@ export class AppsWriter {
       const appDir = await this.requireAppDir(appId);
       const appManifest = await this.readAppObject(appDir, appId);
       const declaredPackage = nonBlankString(appManifest.packageName);
-      // A brand-new app (`apps create <id>`) stores the id as a placeholder;
-      // the first successful upload replaces it with the APK package.
-      const bindPackage = declaredPackage === null || declaredPackage === appId;
+      const bound = manifestPackageBound(appManifest, appId);
+      // Only an explicitly unbound app without a real package binds on upload.
+      const bindPackage =
+        !bound && (declaredPackage === null || declaredPackage === appId);
       const expectedPackageName =
         options.expectedPackageName ??
-        (bindPackage ? received.metadata.packageName : declaredPackage);
+        (bindPackage ? received.metadata.packageName : (declaredPackage ?? appId));
       const abi = options.declaredAbi ?? artifactAbiOf(received.metadata);
 
       if (bindPackage) {
         // The package may equal the app id while another app already owns it;
-        // always check before binding (the helper skips this app and placeholders).
+        // always check before binding (the helper skips this app and unbound apps).
         await this.assertPackageUnused(received.metadata.packageName, appId);
       }
 
@@ -526,6 +540,7 @@ export class AppsWriter {
         await writeJsonAtomic(path.join(appDir, "app.json"), {
           ...appManifest,
           packageName: received.metadata.packageName,
+          packageBound: true,
         });
       }
 
@@ -600,10 +615,12 @@ export class AppsWriter {
       const existingPackage = existingApp
         ? nonBlankString(existingApp.packageName)
         : null;
+      // A bound app (including auto-created id == package) must match before
+      // any version/draft is written; only an unbound app binds here.
       const appPackageName =
-        existingPackage === null || existingPackage === appId
+        existingApp === null || !existingApp.packageBound
           ? metadata.packageName
-          : existingPackage;
+          : (existingPackage ?? appId);
       const appName =
         options.name ??
         metadata.label ??
@@ -661,10 +678,8 @@ export class AppsWriter {
           if (error instanceof HttpError && error.code === "package_in_use") throw error;
           const raced = await this.reader.getApp(appId);
           if (!raced) throw error;
-          const racedPackage = nonBlankString(raced.packageName);
-          const racedIsPlaceholder =
-            racedPackage === null || racedPackage === appId;
-          if (!racedIsPlaceholder && racedPackage !== metadata.packageName) {
+          const racedPackage = nonBlankString(raced.packageName) ?? appId;
+          if (raced.packageBound && racedPackage !== metadata.packageName) {
             throw new HttpError(
               409,
               "package_in_use",
@@ -902,12 +917,12 @@ export class AppsWriter {
     }
   }
 
-  /** Rejects a package already bound to another app (placeholders are unbound). */
+  /** Rejects a package already bound to another app (unbound placeholders do not reserve). */
   private async assertPackageUnused(packageName: string, excludeAppId: string): Promise<void> {
     const apps = await this.reader.listApps();
     for (const app of apps) {
       if (app.id === excludeAppId) continue;
-      if (app.packageName === app.id) continue;
+      if (!app.packageBound) continue;
       if (app.packageName === packageName) {
         throw new HttpError(
           409,

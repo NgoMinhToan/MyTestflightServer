@@ -239,6 +239,7 @@ test("import refuses to mutate a concurrently created app with another package",
     id: "race",
     name: "Race",
     packageName: "com.other.app",
+    packageBound: true,
     description: "",
     developer: "",
     iconPath: null,
@@ -307,3 +308,180 @@ test("checks uniqueness even when the APK package equals the app id", async (t) 
   assert.equal(upload.statusCode, 409);
   assert.equal(upload.json().error.code, "package_in_use");
 });
+
+test("does not rebind an auto-created app whose id equals its package", async (t) => {
+  const harness = await createHarness(t);
+  const appId = "com.example.raster";
+  const first = await importApkRequest(
+    harness.app,
+    makeRasterApk({
+      packageName: appId,
+      versionName: "1.0.0",
+      versionCode: 1,
+      abis: ["arm64-v8a"],
+    }),
+    { create: "true" },
+  );
+  assert.equal(first.statusCode, 201);
+  assert.equal(first.json().app.packageBound, true);
+  const initial = await readJson(path.join(harness.appsDir, appId, "app.json"));
+  assert.equal(initial.packageName, appId);
+  assert.equal(initial.packageBound, true);
+
+  const other = () =>
+    makeRasterApk({
+      packageName: "com.other.pkg",
+      versionName: "1.0.0",
+      versionCode: 1,
+      abis: ["arm64-v8a"],
+    });
+  const rejected = await uploadApk(harness.app, appId, "1.0.0", "arm64-v8a", other());
+  assert.equal(rejected.statusCode, 422);
+  assert.equal(rejected.json().error.code, "apk_metadata_mismatch");
+  let manifest = await readJson(path.join(harness.appsDir, appId, "app.json"));
+  assert.equal(manifest.packageName, appId);
+  assert.equal(manifest.packageBound, true);
+
+  const allowed = await uploadApk(harness.app, appId, "1.0.0", "arm64-v8a", other(), {
+    query: { allow_mismatch: "package" },
+  });
+  assert.equal(allowed.statusCode, 200, "same ABI is a replacement");
+  manifest = await readJson(path.join(harness.appsDir, appId, "app.json"));
+  assert.equal(manifest.packageName, appId, "allow_mismatch never rebinds");
+  assert.equal(manifest.packageBound, true);
+});
+
+test("import rejects a bound app before creating a version", async (t) => {
+  const harness = await createHarness(t);
+  const appId = "com.example.raster";
+  const first = await importApkRequest(
+    harness.app,
+    makeRasterApk({
+      packageName: appId,
+      versionName: "1.0.0",
+      versionCode: 1,
+      abis: ["arm64-v8a"],
+    }),
+    { create: "true" },
+  );
+  assert.equal(first.statusCode, 201);
+
+  const other = () =>
+    makeRasterApk({
+      packageName: "com.other.pkg",
+      versionName: "2.0.0",
+      versionCode: 2,
+      abis: ["arm64-v8a"],
+    });
+  const rejected = await importApkRequest(harness.app, other(), {
+    appId,
+    version: "2.0.0",
+  });
+  assert.equal(rejected.statusCode, 422);
+  assert.equal(rejected.json().error.code, "apk_metadata_mismatch");
+  assert.equal(
+    await pathExists(path.join(harness.appsDir, appId, "versions", "2.0.0")),
+    false,
+    "a 422 must not create a draft version",
+  );
+  let manifest = await readJson(path.join(harness.appsDir, appId, "app.json"));
+  assert.equal(manifest.packageName, appId);
+
+  const allowed = await importApkRequest(harness.app, other(), {
+    appId,
+    version: "2.0.0",
+    allow_mismatch: "package",
+  });
+  assert.equal(allowed.statusCode, 201);
+  manifest = await readJson(path.join(harness.appsDir, appId, "app.json"));
+  assert.equal(manifest.packageName, appId, "allow_mismatch never rebinds");
+  assert.equal(manifest.packageBound, true);
+  assert.equal(
+    await pathExists(path.join(harness.appsDir, appId, "versions", "2.0.0")),
+    true,
+  );
+});
+
+test("import binds a legacy placeholder app", async (t) => {
+  const harness = await createHarness(t);
+  await injectJson(harness.app, "POST", "/api/v1/apps", { id: "legacy-import" });
+  const before = await readJson(
+    path.join(harness.appsDir, "legacy-import", "app.json"),
+  );
+  assert.equal(before.packageBound, false);
+
+  const response = await importApkRequest(
+    harness.app,
+    makeRasterApk({
+      packageName: "com.legacy.import",
+      versionName: "1.0.0",
+      versionCode: 1,
+      abis: ["arm64-v8a"],
+    }),
+    { appId: "legacy-import", version: "1.0.0" },
+  );
+  assert.equal(response.statusCode, 201);
+  const manifest = await readJson(
+    path.join(harness.appsDir, "legacy-import", "app.json"),
+  );
+  assert.equal(manifest.packageName, "com.legacy.import");
+  assert.equal(manifest.packageBound, true);
+});
+
+test("an upload binds a legacy placeholder app", async (t) => {
+  const harness = await createHarness(t);
+  await injectJson(harness.app, "POST", "/api/v1/apps", { id: "legacy-upload" });
+  await injectJson(harness.app, "POST", "/api/v1/apps/legacy-upload/versions", {
+    versionName: "1.0.0",
+    versionCode: 1,
+  });
+
+  const upload = await uploadApk(
+    harness.app,
+    "legacy-upload",
+    "1.0.0",
+    "arm64-v8a",
+    makeRasterApk({
+      packageName: "com.legacy.upload",
+      versionName: "1.0.0",
+      versionCode: 1,
+      abis: ["arm64-v8a"],
+    }),
+  );
+  assert.equal(upload.statusCode, 201);
+  const manifest = await readJson(
+    path.join(harness.appsDir, "legacy-upload", "app.json"),
+  );
+  assert.equal(manifest.packageName, "com.legacy.upload");
+  assert.equal(manifest.packageBound, true);
+});
+
+test("bound auto-created apps reserve their package", async (t) => {
+  const harness = await createHarness(t);
+  const appId = "com.example.raster";
+  const imported = await importApkRequest(
+    harness.app,
+    makeRasterApk({
+      packageName: appId,
+      versionName: "1.0.0",
+      versionCode: 1,
+      abis: ["arm64-v8a"],
+    }),
+    { create: "true" },
+  );
+  assert.equal(imported.statusCode, 201);
+
+  const duplicate = await injectJson(harness.app, "POST", "/api/v1/apps", {
+    id: "other",
+    packageName: appId,
+  });
+  assert.equal(duplicate.statusCode, 409);
+  assert.equal(duplicate.json().error.code, "package_in_use");
+});
+
+async function pathExists(target: string): Promise<boolean> {
+  return fs
+    .stat(target)
+    .then(() => true)
+    .catch(() => false);
+}

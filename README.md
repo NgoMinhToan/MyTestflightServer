@@ -88,6 +88,7 @@ phải `encodeURIComponent` khi đưa tên vào URL; server dùng đúng giá tr
   "schemaVersion": 1,
   "name": "Internal CRM",
   "packageName": "com.company.crm",
+  "packageBound": true,
   "description": "",
   "developer": "",
   "icon": "app_icon.png"
@@ -190,17 +191,37 @@ thất bại; version chỉ đơn giản không có `version_icon.*`.
 
 ### Package
 
-- `POST /api/v1/apps` có thể bỏ `packageName`; khi đó server dùng `id` làm giá trị tạm.
-- Lần upload/import APK **thành công đầu tiên** ghi package thật vào `app.json.packageName` và
-  `version.json.detectedPackageName`. Từ đó mọi upload phải khớp package; khác → `422
-  apk_metadata_mismatch`.
-- `allow_mismatch=package` vẫn là escape hatch cho API/CLI; nó **không** đổi package đã bind.
-- Package đã bind là duy nhất giữa các app: tạo app/bind trùng → `409 package_in_use`.
+`app.json.packageBound` là nguồn sự thật cho việc verify package:
+
+- `packageBound: true`: `packageName` là package thật; mọi upload/import phải khớp, khác → `422
+  apk_metadata_mismatch` (trừ khi bật `allow_mismatch=package`).
+- `packageBound: false`: `packageName` chỉ là giá trị tạm (thường bằng `id`). Lần upload/import APK
+  **thành công đầu tiên** ghi package thật vào `app.json.packageName`, đặt `packageBound: true`, và
+  ghi `version.json.detectedPackageName`.
+
+Quy tắc tạo/bind:
+
+- `POST /api/v1/apps` có `packageName` → `packageBound: true`, **kể cả khi packageName trùng `id`**.
+- Bỏ `packageName` → `packageBound: false` và dùng `id` làm giá trị tạm.
+- `POST /api/v1/import?create=true` luôn tạo app ở trạng thái bound (nó luôn có package từ APK).
+- `app.json` cũ không có `packageBound` được suy luận: bound khi `packageName` khác rỗng và khác
+  `id`; unbound khi rỗng hoặc bằng `id`. Đây chỉ là tương thích ngược — app auto-create kiểu mới
+  luôn lưu cờ tường minh.
+- `AppSummary`/`AppDetail` trả thêm `packageBound` để dashboard phân biệt app đã bind và app còn
+  chờ APK đầu tiên.
+
+Các ràng buộc:
+
+- `allow_mismatch=package` vẫn là escape hatch cho API/CLI: nó chấp nhận artifact lệch package
+  nhưng **không bao giờ** ghi lại `app.json.packageName` của app đã bind.
+- Package của app bound là duy nhất: tạo app/bind trùng → `409 package_in_use`. App unbound không
+  giữ chỗ package.
 - Đổi `packageName` qua `PUT /api/v1/apps/:appId` khi bất kỳ version nào đã có artifact →
-  `409 package_locked`; khi chưa có artifact thì được phép (và vẫn phải duy nhất).
+  `409 package_locked`; khi chưa có artifact thì được phép (và vẫn phải duy nhất). Gửi packageName
+  không rỗng đặt `packageBound: true`.
 - `POST /api/v1/import` mặc định `appId = appIdFromPackage(packageName)`, tên app lấy từ
   `?name=` hoặc `label` của APK; version mặc định là `versionName` đã resolve, nếu vẫn rỗng thì dùng
-  `String(versionCode)`.
+  `String(versionCode)`. Import kiểm tra package của app bound **trước khi** tạo version/draft.
 
 Package do operator nhập vào `POST/PUT /apps` được kiểm tra dạng Android package (các segment chữ,
 số, `_`; tối đa 255 ký tự). Package đọc từ APK không bị áp quy tắc này.

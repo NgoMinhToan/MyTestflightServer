@@ -36,6 +36,7 @@ test("normalizes a bare app directory", async (t) => {
   assert.equal(app.id, "blank_app");
   assert.equal(app.name, "Blank App");
   assert.equal(app.packageName, "blank_app");
+  assert.equal(app.packageBound, false);
   assert.equal(app.versionCount, 0);
   assert.equal(app.latestVersion, null);
   assert.equal(app.iconPath, null);
@@ -45,6 +46,7 @@ test("normalizes a bare app directory", async (t) => {
   );
   assert.equal(created.name, "Blank App");
   assert.equal(created.schemaVersion, 1);
+  assert.equal(created.packageBound, false);
   assert.ok(
     (await fs.stat(path.join(harness.appsDir, "blank_app", "versions"))).isDirectory(),
   );
@@ -75,6 +77,7 @@ test("selects the newest version and lists versions newest first", async (t) => 
   );
 
   const list = (await harness.app.inject("/api/v1/apps")).json() as any;
+  assert.equal(list.apps[0].packageBound, true, "legacy real package infers bound");
   const latest = list.apps[0].latestVersion;
   assert.equal(latest.versionCode, 10);
   assert.equal(latest.versionName, "2.0.0");

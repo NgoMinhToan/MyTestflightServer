@@ -75,6 +75,11 @@ export interface AppManifest {
   schemaVersion: number;
   name: string;
   packageName: string;
+  /**
+   * `true` once the package is authoritative for upload verification. `false`
+   * means `packageName` is only a placeholder (usually the app id).
+   */
+  packageBound: boolean;
   description: string;
   developer: string;
   icon: string;
@@ -127,6 +132,7 @@ export interface AppRecord {
   id: string;
   name: string;
   packageName: string;
+  packageBound: boolean;
   description: string;
   developer: string;
   iconPath: string | null;
@@ -204,6 +210,8 @@ export interface AppSummary {
   id: string;
   name: string;
   packageName: string;
+  /** `false` while the package is only a placeholder awaiting the first APK. */
+  packageBound: boolean;
   description: string;
   developer: string;
   iconPath: string | null;

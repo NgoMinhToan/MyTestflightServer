@@ -83,10 +83,25 @@ export function defaultAppManifest(id: string): AppManifest {
     schemaVersion: 1,
     name: humanizeAppId(id),
     packageName: id,
+    packageBound: false,
     description: "",
     developer: "",
     icon: DEFAULT_ICON,
   };
+}
+
+/**
+ * Bound-state for a raw `app.json` object. New manifests persist `packageBound`;
+ * legacy manifests without it are inferred as bound only when the package is a
+ * real value that differs from the app id.
+ */
+export function manifestPackageBound(
+  record: Record<string, unknown>,
+  id: string,
+): boolean {
+  if (typeof record.packageBound === "boolean") return record.packageBound;
+  const packageName = nonBlankString(record.packageName);
+  return packageName !== null && packageName !== id;
 }
 
 export function normalizeAppManifest(value: unknown, id: string): AppManifest {
@@ -101,6 +116,7 @@ export function normalizeAppManifest(value: unknown, id: string): AppManifest {
         : 1,
     name: nonBlankString(record.name) ?? humanizeAppId(id),
     packageName: nonBlankString(record.packageName) ?? id,
+    packageBound: manifestPackageBound(record, id),
     description: typeof record.description === "string" ? record.description : "",
     developer: typeof record.developer === "string" ? record.developer : "",
     icon: nonBlankString(record.icon) ?? DEFAULT_ICON,
