@@ -1,7 +1,17 @@
 import { HttpError } from "./http-errors";
 import { MISMATCH_KINDS, type MismatchKind } from "./apk-verify";
+import { isValidPackageName } from "./app-id";
 import type { ApkAbi } from "./types";
 import { ID_PATTERN, normalizeAbi } from "./volume";
+
+export { requireValidVersionName } from "./version-name";
+
+export function requireValidPackageName(value: string, label = "packageName"): string {
+  if (!isValidPackageName(value)) {
+    throw new HttpError(400, "invalid_request", `Invalid ${label} "${value}"`);
+  }
+  return value;
+}
 
 export function requireValidId(value: string, label: string): string {
   if (!ID_PATTERN.test(value)) {

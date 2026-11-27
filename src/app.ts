@@ -6,7 +6,7 @@ import { AppsWriter } from "./apps-writer";
 import type { Config } from "./config";
 import { HttpError, sendError } from "./http-errors";
 import { ensureManagementConfig } from "./management-config";
-import { parseAbiQuery, requireValidId } from "./params";
+import { parseAbiQuery, requireValidId, requireValidVersionName } from "./params";
 
 export interface BuildAppOptions {
   logger?: boolean | { level: string };
@@ -126,7 +126,7 @@ export function buildApp(config: Config, options: BuildAppOptions = {}): Fastify
     "/api/v1/apps/:appId/versions/:versionName/download",
     async (request, reply) => {
       const appId = requireValidId(request.params.appId, "app id");
-      const versionName = requireValidId(request.params.versionName, "version name");
+      const versionName = requireValidVersionName(request.params.versionName);
       const abi = parseAbiQuery(request.query.abi);
 
       const lookup = await service.getDownload(appId, versionName, abi);

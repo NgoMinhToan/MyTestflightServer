@@ -7,6 +7,25 @@ export type ApkAbi =
   | "riscv64"
   | "armeabi";
 
+export type ApkIconContentType = "image/png" | "image/webp" | "image/jpeg";
+
+/**
+ * Launcher icon resolved from `resources.arsc`, never containing image bytes.
+ * The dashboard previews `entry` itself; the server only extracts rasters.
+ */
+export type ApkIconDescriptor =
+  | {
+      kind: "raster";
+      entry: string;
+      contentType: ApkIconContentType;
+      resourceId: number;
+      density: number;
+    }
+  | { kind: "adaptive"; entry: string; resourceId: number }
+  | { kind: "vector"; entry: string; resourceId: number };
+
+export type VersionNameSource = "literal" | "resource" | "none";
+
 /**
  * Metadata parsed from an APK's binary `AndroidManifest.xml` plus its native
  * library directories. Shared contract with the CLI and dashboard.
@@ -15,8 +34,14 @@ export interface ApkMetadata {
   packageName: string;
   /** Positive integer literal from `android:versionCode`. */
   versionCode: number;
-  /** `null` when the manifest uses a resource reference or non-string type. */
+  /** `null` when the manifest uses an unresolvable reference or non-string type. */
   versionName: string | null;
+  /** How `versionName` was obtained; `none` means the fallback applies. */
+  versionNameSource: VersionNameSource;
+  /** `android:label` after resolving a resource reference through `resources.arsc`. */
+  label: string | null;
+  /** Launcher icon descriptor resolved from `android:icon`/`android:roundIcon`. */
+  icon: ApkIconDescriptor | null;
   minSdk: number | null;
   targetSdk: number | null;
   /** ABI directories under `lib/`; never contains `universal`. */
@@ -70,6 +95,10 @@ export interface VersionManifest {
   file?: string;
   sha256?: string | null;
   artifacts?: ApkArtifactManifest[];
+  /** Server-owned raster icon filename (`version_icon.<ext>`). */
+  icon?: string;
+  /** Package name read from the APK that first populated this version. */
+  detectedPackageName?: string;
 }
 
 export interface ApkArtifactRecord {
@@ -89,6 +118,9 @@ export interface VersionRecord {
   publishedAt: string;
   artifacts: ApkArtifactRecord[];
   defaultArtifact: ApkArtifactRecord;
+  /** Resolved `version.json.icon` file, used for the app icon fallback. */
+  iconPath: string | null;
+  iconContentType: string | null;
 }
 
 export interface AppRecord {
@@ -146,6 +178,12 @@ export interface VersionEntry {
   releaseNotes: string | null;
   publishedAt: string;
   artifacts: ApkArtifactRecord[];
+  /** `version.json.icon` filename when it resolves to a file in the version dir. */
+  icon: string | null;
+  iconPath: string | null;
+  iconContentType: string | null;
+  /** Package name recorded from the APK upload. */
+  detectedPackageName: string | null;
 }
 
 export interface VersionSummary {

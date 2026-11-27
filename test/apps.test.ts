@@ -363,9 +363,17 @@ test("returns app_not_found for unknown apps and invalid_request for malformed v
   assert.equal(download.statusCode, 404);
   assert.equal((download.json() as any).error.code, "app_not_found");
 
-  const malformed = await harness.app.inject("/api/v1/apps/missing/versions/bad%20version/download");
+  const flexible = await harness.app.inject(
+    "/api/v1/apps/missing/versions/bad%20version/download",
+  );
+  assert.equal(flexible.statusCode, 404, "spaces are a valid flexible version name");
+  assert.equal((flexible.json() as any).error.code, "app_not_found");
+
+  const malformed = await harness.app.inject(
+    "/api/v1/apps/missing/versions/bad%2Fversion/download",
+  );
   assert.equal(malformed.statusCode, 400);
-  assert.equal((malformed.json() as any).error.code, "invalid_request");
+  assert.equal((malformed.json() as any).error.code, "version_name_invalid");
 });
 
 test("exposes declared artifacts and points legacy fields at the universal APK", async (t) => {

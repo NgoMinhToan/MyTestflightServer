@@ -11,6 +11,10 @@ import {
   toDetected,
 } from "../src/apk-inspect";
 import {
+  REAL_ADAPTIVE_ICON_FIXTURE,
+  REAL_ARSC_FIXTURE,
+  REAL_VECTOR_ICON_FIXTURE,
+  loadFixture,
   makeApk,
   realManifestBytes,
   REAL_MANIFEST_EXPECTED,
@@ -41,9 +45,51 @@ test("parses the shared real AndroidManifest.xml fixture", async () => {
   assert.equal(metadata.universal, false);
   assert.equal(metadata.configSplit, false);
   assert.equal(artifactAbiOf(metadata), REAL_MANIFEST_EXPECTED.artifactAbi);
+  assert.equal(metadata.versionNameSource, "literal");
+  assert.equal(metadata.label, null, "no resources.arsc in this fixture");
+  assert.equal(metadata.icon, null);
 
   const detected = toDetected(metadata);
   assert.equal(detected.artifactAbi, REAL_MANIFEST_EXPECTED.artifactAbi);
+});
+
+test("resolves label, versionName, and adaptive icon from the real resources.arsc", async () => {
+  const apk = makeApk({
+    manifestBytes: realManifestBytes(),
+    abis: [REAL_MANIFEST_EXPECTED.artifactAbi],
+    resourcesArsc: loadFixture(REAL_ARSC_FIXTURE),
+    extraEntries: [
+      { name: "res/BW.xml", data: loadFixture(REAL_ADAPTIVE_ICON_FIXTURE) },
+      { name: "res/Qr.xml", data: loadFixture(REAL_VECTOR_ICON_FIXTURE) },
+    ],
+  });
+  const metadata = await inspectApkBytes(apk);
+
+  assert.equal(metadata.label, "My TestFlight");
+  assert.equal(metadata.versionName, "0.2.0");
+  assert.equal(metadata.versionNameSource, "literal");
+  assert.deepEqual(metadata.icon, {
+    kind: "adaptive",
+    entry: "res/BW.xml",
+    resourceId: 0x7f0b0000,
+  });
+
+  // Detected metadata carries only descriptors, never image bytes or tables.
+  const detected = toDetected(metadata);
+  assert.deepEqual(detected.icon, metadata.icon);
+  assert.equal(JSON.stringify(detected).includes("adaptive-icon"), false);
+  assert.ok(JSON.stringify(detected).length < 2000);
+});
+
+test("resolves a literal label and marks unresolved references as none", async () => {
+  const literal = await inspectApkBytes(makeApk({ label: "Literal Label" }));
+  assert.equal(literal.label, "Literal Label");
+
+  const unresolved = await inspectApkBytes(
+    makeApk({ versionNameAsReference: true, versionNameRef: 0x7f0e0005 }),
+  );
+  assert.equal(unresolved.versionName, null);
+  assert.equal(unresolved.versionNameSource, "none");
 });
 
 test("parses stored and deflated manifest entries", async () => {
