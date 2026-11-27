@@ -276,3 +276,34 @@ test("import refuses to mutate a concurrently created app with another package",
   );
   assert.equal(appReads, 2);
 });
+
+test("checks uniqueness even when the APK package equals the app id", async (t) => {
+  const harness = await createHarness(t);
+  // App A is a placeholder whose id happens to be the package name.
+  await injectJson(harness.app, "POST", "/api/v1/apps", { id: "com.acme" });
+  await injectJson(harness.app, "POST", "/api/v1/apps/com.acme/versions", {
+    versionName: "1.0.0",
+    versionCode: 1,
+  });
+  // App B already owns the real package "com.acme".
+  const owner = await injectJson(harness.app, "POST", "/api/v1/apps", {
+    id: "owner",
+    packageName: "com.acme",
+  });
+  assert.equal(owner.statusCode, 201);
+
+  const upload = await uploadApk(
+    harness.app,
+    "com.acme",
+    "1.0.0",
+    "arm64-v8a",
+    makeRasterApk({
+      packageName: "com.acme",
+      versionName: "1.0.0",
+      versionCode: 1,
+      abis: ["arm64-v8a"],
+    }),
+  );
+  assert.equal(upload.statusCode, 409);
+  assert.equal(upload.json().error.code, "package_in_use");
+});

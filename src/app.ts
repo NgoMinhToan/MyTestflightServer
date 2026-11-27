@@ -40,6 +40,23 @@ const FASTIFY_ERROR_MAP: Record<string, { status: number; code: string; message:
   },
 };
 
+/**
+ * `Content-Disposition` with an ASCII-safe quoted fallback plus RFC 5987
+ * `filename*`. Version names may contain quotes, backslashes, controls, or
+ * non-Latin characters, none of which may reach a raw header value unchanged.
+ */
+export function contentDisposition(filename: string): string {
+  const ascii = filename
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "_")
+    .replace(/["\\]/g, "_")
+    .replace(/[^\x20-\x7e]/g, "_");
+  const encoded = encodeURIComponent(filename).replace(
+    /['()*]/g,
+    (character) => `%${character.codePointAt(0)!.toString(16).toUpperCase()}`,
+  );
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
 function registerCors(app: FastifyInstance, origins: string[]): void {
   if (origins.length === 0) return;
   const allowAll = origins.includes("*");
@@ -146,7 +163,7 @@ export function buildApp(config: Config, options: BuildAppOptions = {}): Fastify
 
       const download = lookup.download;
       reply.header("Content-Type", "application/vnd.android.package-archive");
-      reply.header("Content-Disposition", `attachment; filename="${download.filename}"`);
+      reply.header("Content-Disposition", contentDisposition(download.filename));
       reply.header("Content-Length", String(download.fileSize));
       reply.header("Cache-Control", "no-store");
       if (download.sha256) reply.header("X-Checksum-Sha256", download.sha256);

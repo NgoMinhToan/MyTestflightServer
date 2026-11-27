@@ -4,6 +4,14 @@ import path from "node:path";
 import test from "node:test";
 import { createHarness, writeApk, writeAppJson, writeVersion } from "./harness";
 
+function assertDisposition(header: string | undefined, filename: string): void {
+  assert.ok(header, "missing Content-Disposition");
+  const match = /^attachment; filename="([^"]*)"; filename\*=UTF-8''(.+)$/.exec(header);
+  assert.ok(match, `invalid Content-Disposition: ${header}`);
+  assert.match(match[1]!, /^[\x20-\x7e]*$/, "ASCII fallback must be printable ASCII");
+  assert.equal(decodeURIComponent(match[2]!), filename);
+}
+
 test("creates the apps directory and serves an empty catalog", async (t) => {
   const harness = await createHarness(t);
   await fs.rm(harness.appsDir, { recursive: true, force: true });
@@ -150,10 +158,7 @@ test("downloads an APK with the required headers", async (t) => {
   const response = await harness.app.inject("/api/v1/apps/demo/versions/1.0.0/download");
   assert.equal(response.statusCode, 200);
   assert.equal(response.headers["content-type"], "application/vnd.android.package-archive");
-  assert.equal(
-    response.headers["content-disposition"],
-    'attachment; filename="demo-1.0.0.apk"',
-  );
+  assertDisposition(response.headers["content-disposition"], "demo-1.0.0.apk");
   assert.equal(response.headers["content-length"], String(apk.byteLength));
   assert.equal(response.headers["cache-control"], "no-store");
   assert.equal(response.headers["x-checksum-sha256"], "b".repeat(64));
@@ -422,7 +427,7 @@ test("exposes declared artifacts and points legacy fields at the universal APK",
   assert.equal(byAbi.get("armeabi-v7a").sha256, null);
 
   const download = await harness.app.inject("/api/v1/apps/demo/versions/1.0.0/download");
-  assert.equal(download.headers["content-disposition"], 'attachment; filename="demo-1.0.0.apk"');
+  assertDisposition(download.headers["content-disposition"], "demo-1.0.0.apk");
   assert.deepEqual(download.rawPayload, universal);
 });
 
@@ -459,7 +464,7 @@ test("defaults to the highest-priority ABI when no universal APK exists", async 
   assert.equal(version.sha256, "d".repeat(64));
 
   const download = await harness.app.inject("/api/v1/apps/demo/versions/1.0.0/download");
-  assert.equal(download.headers["content-disposition"], 'attachment; filename="demo-1.0.0.apk"');
+  assertDisposition(download.headers["content-disposition"], "demo-1.0.0.apk");
   assert.deepEqual(download.rawPayload, arm64);
 });
 
@@ -490,9 +495,9 @@ test("downloads a requested ABI with an ABI-suffixed filename", async (t) => {
   );
   assert.equal(response.statusCode, 200);
   assert.deepEqual(response.rawPayload, arm64);
-  assert.equal(
+  assertDisposition(
     response.headers["content-disposition"],
-    'attachment; filename="demo-1.0.0-arm64-v8a.apk"',
+    "demo-1.0.0-arm64-v8a.apk",
   );
   assert.equal(response.headers["content-length"], String(arm64.byteLength));
   assert.equal(response.headers["x-checksum-sha256"], "e".repeat(64));
@@ -571,9 +576,9 @@ test("requires an exact abi match instead of falling back to universal", async (
     "/api/v1/apps/universal_only/versions/1.0.0/download?abi=universal",
   );
   assert.equal(explicitUniversal.statusCode, 200);
-  assert.equal(
+  assertDisposition(
     explicitUniversal.headers["content-disposition"],
-    'attachment; filename="universal_only-1.0.0.apk"',
+    "universal_only-1.0.0.apk",
   );
 });
 
@@ -638,7 +643,7 @@ test("treats a legacy single-APK manifest as a universal artifact", async (t) =>
   assert.equal(version.sizeBytes, apk.byteLength);
 
   const download = await harness.app.inject("/api/v1/apps/demo/versions/1.0.0/download");
-  assert.equal(download.headers["content-disposition"], 'attachment; filename="demo-1.0.0.apk"');
+  assertDisposition(download.headers["content-disposition"], "demo-1.0.0.apk");
   assert.equal(download.headers["x-checksum-sha256"], "f".repeat(64));
   assert.deepEqual(download.rawPayload, apk);
 });
@@ -867,4 +872,32 @@ test("falls back to the legacy file when artifacts is not an array", async (t) =
 
   const download = await harness.app.inject("/api/v1/apps/demo/versions/1.0.0/download");
   assert.deepEqual(download.rawPayload, Buffer.from("legacy"));
+});
+
+test("downloads flexible version names with an RFC 5987 header", async (t) => {
+  const harness = await createHarness(t);
+  await writeAppJson(harness.appsDir, "demo", { name: "Demo" });
+
+  const versionNames = ["1.0.0+42", "Bản nội bộ (beta)", '1.0 "quoted"'];
+  for (const [index, versionName] of versionNames.entries()) {
+    const bytes = Buffer.from(`apk-${index}`);
+    await writeVersion(
+      harness.appsDir,
+      "demo",
+      versionName,
+      { versionCode: index + 1, versionName },
+      bytes,
+    );
+
+    const encoded = encodeURIComponent(versionName);
+    const download = await harness.app.inject(
+      `/api/v1/apps/demo/versions/${encoded}/download`,
+    );
+    assert.equal(download.statusCode, 200, versionName);
+    assertDisposition(
+      download.headers["content-disposition"],
+      `demo-${versionName}.apk`,
+    );
+    assert.deepEqual(download.rawPayload, bytes);
+  }
 });

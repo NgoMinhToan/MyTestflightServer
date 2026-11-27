@@ -463,10 +463,9 @@ export class AppsWriter {
         (bindPackage ? received.metadata.packageName : declaredPackage);
       const abi = options.declaredAbi ?? artifactAbiOf(received.metadata);
 
-      if (
-        bindPackage &&
-        received.metadata.packageName !== appId
-      ) {
+      if (bindPackage) {
+        // The package may equal the app id while another app already owns it;
+        // always check before binding (the helper skips this app and placeholders).
         await this.assertPackageUnused(received.metadata.packageName, appId);
       }
 
