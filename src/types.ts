@@ -7,6 +7,45 @@ export type ApkAbi =
   | "riscv64"
   | "armeabi";
 
+/**
+ * Metadata parsed from an APK's binary `AndroidManifest.xml` plus its native
+ * library directories. Shared contract with the CLI and dashboard.
+ */
+export interface ApkMetadata {
+  packageName: string;
+  /** Positive integer literal from `android:versionCode`. */
+  versionCode: number;
+  /** `null` when the manifest uses a resource reference or non-string type. */
+  versionName: string | null;
+  minSdk: number | null;
+  targetSdk: number | null;
+  /** ABI directories under `lib/`; never contains `universal`. */
+  abis: ApkAbi[];
+  /** `true` when the APK is not a single-ABI split (0 or more than 1 ABI). */
+  universal: boolean;
+  debuggable: boolean;
+  testOnly: boolean;
+  /** `android:split` value, when present. */
+  split: string | null;
+  /** `true` for configuration splits, which the server rejects. */
+  configSplit: boolean;
+}
+
+/** `ApkMetadata` plus the ABI the artifact is stored under. */
+export interface DetectedApk extends ApkMetadata {
+  artifactAbi: ApkAbi;
+}
+
+/** Response body of `POST /api/v1/import`. */
+export interface ImportResult {
+  app: AppDetail;
+  version: VersionAdmin;
+  detected: DetectedApk;
+  artifact: ApkArtifactSummary;
+  createdApp: boolean;
+  createdVersion: boolean;
+}
+
 export interface AppManifest {
   schemaVersion: number;
   name: string;

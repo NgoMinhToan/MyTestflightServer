@@ -15,19 +15,25 @@ src/
 ├── config.ts        # env parsing (HOST, PORT, DATA_DIR, LOG_LEVEL, MAX_APK_BYTES)
 ├── types.ts         # manifest/record/API types
 ├── volume.ts        # shared path/manifest helpers, atomic writes, keyed lock
+├── apk-inspect.ts   # ZIP + binary AndroidManifest.xml parser
+├── apk-verify.ts    # pure metadata verification (package/version/sdk/abi)
 ├── apps-service.ts  # volume scan, version resolution, read model
-├── apps-writer.ts   # app/version/artifact/icon mutations, streaming upload
+├── apps-writer.ts   # app/version/artifact/icon mutations, receive/store/import
 ├── admin-routes.ts  # write routes and upload content-type parsers
 ├── management-config.ts # $DATA_DIR/config.json creation and key checks
-├── params.ts        # id/abi request validation
+├── params.ts        # id/abi/query request validation
 ├── http-errors.ts   # HttpError + sendError
 ├── app.ts           # Fastify factory, read routes, error handling
 └── main.ts          # listen + graceful shutdown
 test/
-├── harness.ts       # temp-volume harness, fixtures, auth headers
-├── apps.test.ts     # 30 read cases
-├── admin.test.ts    # 18 write cases
-└── management-key.test.ts # 8 auth/config cases
+├── harness.ts       # temp-volume harness, upload/import helpers, auth headers
+├── apk-fixtures.ts  # ZIP/AXML builders + shared real manifest
+├── fixtures/real-manifest.ts # base64 of the shared 8000-byte AndroidManifest.xml
+├── apk-inspect.test.ts # parser matrix + real fixture
+├── apps.test.ts     # read cases
+├── admin.test.ts    # write/upload/import cases
+├── cors.test.ts     # CORS cases
+└── management-key.test.ts # auth/config cases
 Dockerfile
 docker-entrypoint.sh
 .github/workflows/build-image.yml
@@ -194,8 +200,10 @@ public. See [Management key](#management-key).
 | POST | `/api/v1/apps/:appId/versions` | JSON `{ versionName, versionCode, minSdk?, releaseNotes?, publishedAt? }`; 201 draft; 409 `version_exists` |
 | PUT | `/api/v1/apps/:appId/versions/:versionName` | Partial metadata (`versionCode`, `minSdk`, `releaseNotes`, `publishedAt`); 200 |
 | DELETE | `/api/v1/apps/:appId/versions/:versionName` | 204 |
-| PUT | `/api/v1/apps/:appId/versions/:versionName/artifacts/:abi` | Raw APK; 201 new / 200 replaced; body `{ version }` |
+| PUT | `/api/v1/apps/:appId/versions/:versionName/artifacts/:abi` | Raw APK; optional `?allow_mismatch=`; 201 new / 200 replaced; body `{ version, detected }` |
+| PUT | `/api/v1/apps/:appId/versions/:versionName/artifacts` | Raw APK; infers the ABI from the manifest/`lib/<abi>/`; optional `?allow_mismatch=`; 201 new / 200 replaced; body `{ version, detected }` |
 | DELETE | `/api/v1/apps/:appId/versions/:versionName/artifacts/:abi` | 204; 404 `artifact_not_found` |
+| POST | `/api/v1/import` | Raw APK only; query `create`, `appId`, `version`, `versionCode`, `name`, `releaseNotes`, `publishedAt`, `allow_mismatch`; 201 created / 200 replaced; body `{ app, version, detected, artifact, createdApp, createdVersion }` |
 
 `POST` responses set `Location`. `DELETE` responses are `204` with no body.
 
@@ -238,6 +246,54 @@ a `filename` on each artifact:
 For a draft, `draft` is `true`, `artifacts` is `[]`, and `defaultArtifact`, `sizeBytes`, `sha256`,
 and `downloadPath` are `null`.
 
+### APK inspection and verification
+
+Every uploaded APK is opened and its binary `AndroidManifest.xml` is parsed (ZIP central
+directory, deflate, binary AXML; no Android tooling or extra runtime dependencies). The server
+extracts:
+
+```json
+{
+  "packageName": "com.company.crm",
+  "versionCode": 142,
+  "versionName": "1.4.2",
+  "minSdk": 26,
+  "targetSdk": 37,
+  "abis": ["arm64-v8a"],
+  "universal": false,
+  "debuggable": false,
+  "testOnly": false,
+  "split": null,
+  "configSplit": false,
+  "artifactAbi": "arm64-v8a"
+}
+```
+
+`detected` is returned by every upload and import response. `artifactAbi` is `universal` when the
+APK has no `lib/<abi>/` entries or more than one; otherwise it is the single ABI.
+
+The parsed metadata is verified before the APK is stored:
+
+| Field | Expected | Checked when | Skipped by |
+|---|---|---|---|
+| `packageName` | `app.json.packageName` | always, unless the package is unset | `allow_mismatch=package` |
+| `versionCode` | `version.json.versionCode` (or the import query) | always | `allow_mismatch=version` |
+| `versionName` | route/`version.json` name | when the APK declares a string versionName | `allow_mismatch=version` |
+| `minSdk` | `version.json.minSdk` | when both sides are non-null; a missing `version.json.minSdk` is auto-filled from the APK | `allow_mismatch=sdk` |
+| ABI | route `:abi` | only on the `:abi` route | `allow_mismatch=abi` |
+
+`allow_mismatch` is a comma-separated subset of `package,version,sdk,abi`; an unknown value is a
+400 `invalid_request`. A mismatch without the matching override is a 422
+`apk_metadata_mismatch` whose message lists every mismatched field, for example
+`packageName 'com.new' != app 'com.old'; versionCode 18 != 1`.
+
+`app.json.packageName` is treated as **unset** when it is empty or equal to the app id (the
+`POST /api/v1/apps` default). Package verification is skipped in that case; the server never
+rewrites `app.json`. Set a real package name to lock an app down.
+
+Configuration splits (`android:split="config.*"` or a `configForSplit` attribute) are rejected with
+400 `invalid_apk` — upload the base APK instead. ZIP64 APKs are also rejected.
+
 ### Uploading an APK
 
 ```bash
@@ -254,10 +310,23 @@ curl -X POST http://127.0.0.1:8080/api/v1/apps/crm/versions \
   -H "X-Management-Key: $KEY" \
   -d '{"versionName":"1.4.2","versionCode":142,"minSdk":26}'
 
+# ABI is taken from the route and must match the APK (or pass allow_mismatch=abi).
 curl -X PUT http://127.0.0.1:8080/api/v1/apps/crm/versions/1.4.2/artifacts/arm64-v8a \
   -H 'content-type: application/vnd.android.package-archive' \
   -H "X-Management-Key: $KEY" \
   --data-binary @app-arm64-v8a.apk
+
+# Or let the server infer the ABI from lib/<abi>/ (universal when 0 or >1 ABIs).
+curl -X PUT http://127.0.0.1:8080/api/v1/apps/crm/versions/1.4.2/artifacts \
+  -H 'content-type: application/vnd.android.package-archive' \
+  -H "X-Management-Key: $KEY" \
+  --data-binary @app-universal.apk
+
+# Deliberately accept a versionCode/versionName different from version.json.
+curl -X PUT 'http://127.0.0.1:8080/api/v1/apps/crm/versions/1.4.2/artifacts?allow_mismatch=version' \
+  -H 'content-type: application/vnd.android.package-archive' \
+  -H "X-Management-Key: $KEY" \
+  --data-binary @app-rebuilt.apk
 
 curl -X PUT http://127.0.0.1:8080/api/v1/apps/crm/icon \
   -H 'content-type: image/png' \
@@ -271,21 +340,53 @@ curl -X PUT http://127.0.0.1:8080/api/v1/apps/crm/icon \
   supply `artifacts`, `file`, or `sha256` in a version body (400); artifacts are managed only by the
   artifact routes.
 - `MAX_APK_BYTES` (default `536870912`, 512 MiB) caps one APK upload; icons are capped at 2 MiB.
+  The limit is enforced from `Content-Length` before the file is inspected.
 - Replacing an ABI is an upsert: `PUT` returns 200 and deletes the previous server-owned file once
   nothing references it. A new ABI returns 201.
 - `versionName` is immutable; a `versionName` in a `PUT` body must match the path.
 - `publishedAt` accepts an ISO 8601 string; `null` removes it so the mtime fallback applies.
 
+### Importing an APK
+
+`POST /api/v1/import` takes only the APK body and derives as much as it can from the manifest:
+
+```bash
+# Create the app and version if they do not exist.
+curl -X POST 'http://127.0.0.1:8080/api/v1/import?create=true&appId=crm' \
+  -H 'content-type: application/vnd.android.package-archive' \
+  -H "X-Management-Key: $KEY" \
+  --data-binary @app-arm64-v8a.apk
+
+# Subsequent ABI splits of the same version need no create flag.
+curl -X POST 'http://127.0.0.1:8080/api/v1/import?appId=crm&version=1.4.2' \
+  -H 'content-type: application/vnd.android.package-archive' \
+  -H "X-Management-Key: $KEY" \
+  --data-binary @app-armeabi-v7a.apk
+```
+
+- `appId` defaults to the APK's `packageName`; `version` defaults to the APK's `versionName`
+  (400 `invalid_request` if it is a resource reference and no `?version=` is given);
+  `versionCode` defaults to the APK's value.
+- Without `create=true`, a missing app is 404 `app_not_found`. With `create=true`, the app is
+  created with `packageName` from the APK and `name` from `?name=` or the last package segment.
+  A missing version is always created (the app must exist or be created in the same request).
+- `releaseNotes` and `publishedAt` are applied only when the version is created.
+- Metadata is verified before anything is written, so a 422 never leaves an orphan app/version.
+- Status is 201 when the app, version, or artifact is new and 200 for a pure replacement. Several
+  split APKs with the same `versionName`/`versionCode` land in one version with one artifact per ABI.
+- Response: `{ app, version, detected, artifact, createdApp, createdVersion }`.
+
 ### Write errors
 
 | Status | Codes |
 |---|---|
-| 400 | `invalid_request` (bad id, ABI, body, JSON, or content length) |
+| 400 | `invalid_request` (bad id, ABI, `allow_mismatch`, `create`, body, JSON, or content length); `invalid_apk` (not a ZIP/APK, missing or corrupt `AndroidManifest.xml`, non-integer versionCode, ZIP64, configuration split) |
 | 401 | `invalid_management_key` (missing or wrong `X-Management-Key`) |
 | 404 | `app_not_found`, `version_not_found`, `artifact_not_found`, `icon_not_found` |
 | 409 | `app_exists`, `version_exists`, `app_invalid` (existing `app.json` is unreadable) |
 | 413 | `payload_too_large` (APK or icon limit, or JSON body over 1 MiB) |
 | 415 | `unsupported_media_type` |
+| 422 | `apk_metadata_mismatch` (package/version/versionName/minSdk/ABI differs; message lists each field) |
 | 503 | `management_key_not_configured` (config.json missing, invalid, or blank) |
 
 ## Docker
